@@ -23,12 +23,7 @@ container-runway/
 ├── main.cpp              # メインソースコード（コンテナランタイムの実装）
 ├── json.hpp              # JSONパーサライブラリ（nlohmann/json）
 ├── Makefile              # ビルド設定ファイル
-├── CMakeLists.txt        # CMakeビルド設定
-├── runtime               # ビルド済み実行ファイル
-├── cmake-build-debug/    # CMakeビルドディレクトリ
-├── .idea/                # IDE設定ファイル
-├── .git/                 # Gitリポジトリ
-└── .gitignore            # Git除外設定
+└── CMakeLists.txt        # CMakeビルド設定
 ```
 
 ## コンテナ作成の流れ
@@ -139,10 +134,8 @@ OCI仕様のconfig.jsonに対応する構造体：
 
 ## 今後の改善点
 - エラーハンドリングの強化
-- リソース制限（cgroups）の実装
 - ネットワーク設定の詳細化
 - ログ機能の追加
-- テストスイートの作成
 
 ## 開発者向け情報
 - C++11標準を使用
