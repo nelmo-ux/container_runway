@@ -23,15 +23,17 @@
 
 #include "json.hpp"
 
-// nlohmann::jsonを使いやすくするためのエイリアス
+// A convenient alias for nlohmann::json
 using json = nlohmann::json;
 
 constexpr int STACK_SIZE = 1024 * 1024; // 1MB
 
-// 状態ファイルを保存するベースディレクトリ
-const std::string STATE_BASE_PATH = "/run/runtime/";
+// Base directory to save state files
+const std::string STATE_BASE_PATH = "/run/mruntime/";
+// Base path for cgroups
+const std::string CGROUP_BASE_PATH = "/sys/fs/cgroup/";
 
-// --- config.jsonの構造に対応するC++構造体 ---
+// --- C++ structs corresponding to the config.json structure ---
 
 struct ProcessConfig {
     bool terminal;
@@ -50,11 +52,18 @@ struct LinuxNamespaceConfig {
     std::string path;
 };
 
-struct LinuxConfig {
-    std::vector<LinuxNamespaceConfig> namespaces;
+// Cgroup向けのコンフィグ設定
+struct LinuxResourcesConfig {
+    long long memory_limit = 0; // memory.limit_in_bytes
+    long long cpu_shares = 0;   // cpu.shares
 };
 
-// config.json全体を表す構造体
+struct LinuxConfig {
+    std::vector<LinuxNamespaceConfig> namespaces;
+    LinuxResourcesConfig resources;
+};
+
+// config Jsonのパース用構造
 struct OCIConfig {
     std::string ociVersion;
     RootConfig root;
@@ -63,9 +72,8 @@ struct OCIConfig {
     LinuxConfig linux;
 };
 
-// --- JSONからのデシリアライズ関数 ---
+// --- JSONファイルの読み込み ---
 
-// from_json/to_jsonをnlohmann/jsonにアタッチすることで自動的に変換できる?(とりあえずできてそう)
 void from_json(const json& j, ProcessConfig& p) {
     j.at("args").get_to(p.args);
     j.at("cwd").get_to(p.cwd);
@@ -95,9 +103,23 @@ void from_json(const json& j, LinuxNamespaceConfig& ns) {
     }
 }
 
+// Jsonのパース系
+// Note: Cgroups系の処理がメインPIDに対してのみかかっている可能性
+void from_json(const json& j, LinuxResourcesConfig& res) {
+    if (j.contains("memory") && j["memory"].contains("limit")) {
+        j["memory"].at("limit").get_to(res.memory_limit);
+    }
+    if (j.contains("cpu") && j["cpu"].contains("shares")) {
+        j["cpu"].at("shares").get_to(res.cpu_shares);
+    }
+}
+
 void from_json(const json& j, LinuxConfig& l) {
     if (j.contains("namespaces")) {
         j.at("namespaces").get_to(l.namespaces);
+    }
+    if (j.contains("resources")) {
+        j.at("resources").get_to(l.resources);
     }
 }
 
@@ -113,24 +135,24 @@ void from_json(const json& j, OCIConfig& c) {
     }
 }
 
-// config.jsonを読み込んでパースする関数
+// RW とパース用関数
 OCIConfig load_config(const std::string& bundle_path) {
-    std::string config_path = bundle_path + "./config.json";
+    std::string config_path = bundle_path + "/config.json";
     std::ifstream ifs(config_path);
     if (!ifs) {
-        throw std::runtime_error("config.jsonの読み込みに失敗: " + config_path);
+        throw std::runtime_error("Failed to load config.json: " + config_path);
     }
     json j;
     ifs >> j;
     return j.get<OCIConfig>();
 }
 
-// 名前付きパイプ（FIFO）のパスを生成するヘルパー関数
+// FIFO用のヘルパー関数 以下 Claude生成
 std::string get_fifo_path(const std::string& container_id) {
     return STATE_BASE_PATH + container_id + "/sync_fifo";
 }
 
-// コンテナに渡す引数を格納する構造体
+// Struct to hold arguments for the container
 struct ContainerArgs {
     char** argv;
     std::string sync_fifo_path;
@@ -139,14 +161,13 @@ struct ContainerArgs {
     bool rootfs_readonly;
 };
 
-// コンテナの状態を表す構造体
+// Struct to represent the container's state
 struct ContainerState {
     std::string id;
     pid_t pid = -1;
     std::string status; // creating, created, running, stopped
     std::string bundle_path;
 
-    // 状態をJSON文字列にシリアライズ
     std::string to_json() const {
         json j = {
                 {"id", id},
@@ -154,10 +175,9 @@ struct ContainerState {
                 {"status", status},
                 {"bundle_path", bundle_path}
         };
-        return j.dump(4); // 4スペースでインデント
+        return j.dump(4);
     }
 
-    // JSON文字列からデシリアライズ
     static ContainerState from_json(const std::string& json_str) {
         ContainerState state;
         json j = json::parse(json_str);
@@ -169,17 +189,16 @@ struct ContainerState {
     }
 };
 
-// 状態をファイルに保存/読み込みするヘルパー関数
 bool save_state(const ContainerState& state) {
     std::string container_path = STATE_BASE_PATH + state.id;
     std::string state_file_path = container_path + "/state.json";
     if (mkdir(container_path.c_str(), 0755) != 0 && errno != EEXIST) {
-        perror("状態ディレクトリの作成に失敗");
+        perror("Failed to create state directory");
         return false;
     }
     std::ofstream ofs(state_file_path);
     if (!ofs) {
-        std::cerr << "状態ファイルのオープンに失敗: " << state_file_path << std::endl;
+        std::cerr << "Failed to open state file: " << state_file_path << std::endl;
         return false;
     }
     ofs << state.to_json();
@@ -190,22 +209,85 @@ ContainerState load_state(const std::string& container_id) {
     std::string state_file_path = STATE_BASE_PATH + container_id + "/state.json";
     std::ifstream ifs(state_file_path);
     if (!ifs) {
-        throw std::runtime_error("状態ファイルの読み込みに失敗: " + state_file_path);
+        throw std::runtime_error("Failed to load state file: " + state_file_path);
     }
     std::stringstream buffer;
     buffer << ifs.rdbuf();
     return ContainerState::from_json(buffer.str());
 }
+//ここまで
 
-// 子プロセス（コンテナ）のエントリーポイント
+
+//Cgroup系の処理
+
+// Helper to write to a cgroup file
+void write_cgroup_file(const std::string& path, const std::string& value) {
+    std::ofstream ofs(path);
+    if (!ofs) {
+        throw std::runtime_error("Failed to open cgroup file: " + path);
+    }
+    ofs << value;
+}
+
+//seccomp系アタッチ
+//void attach_bpf(pid_t pid, int& syscalls[], bool isActive){
+//    //Todo: BPF処理を外部実装
+//}
+
+// 制限のアタッチ
+void setup_cgroups(pid_t pid, const std::string& id, const LinuxResourcesConfig& resources) {
+    std::cout << "Setting up cgroups for container " << id << std::endl;
+
+    // Memory Cgroup
+    if (resources.memory_limit > 0) {
+        std::string mem_cgroup_path = CGROUP_BASE_PATH + "memory/my_runtime/" + id;
+        if (mkdir((CGROUP_BASE_PATH + "memory/my_runtime").c_str(), 0755) != 0 && errno != EEXIST) {
+            throw std::system_error(errno, std::system_category(), "Failed to create base memory cgroup dir");
+        }
+        if (mkdir(mem_cgroup_path.c_str(), 0755) != 0 && errno != EEXIST) {
+            throw std::system_error(errno, std::system_category(), "Failed to create memory cgroup dir");
+        }
+        write_cgroup_file(mem_cgroup_path + "/memory.limit_in_bytes", std::to_string(resources.memory_limit));
+        write_cgroup_file(mem_cgroup_path + "/cgroup.procs", std::to_string(pid));
+    }
+
+    // CPU Cgroup
+    if (resources.cpu_shares > 0) {
+        std::string cpu_cgroup_path = CGROUP_BASE_PATH + "cpu/my_runtime/" + id;
+        if (mkdir((CGROUP_BASE_PATH + "cpu/my_runtime").c_str(), 0755) != 0 && errno != EEXIST) {
+            throw std::system_error(errno, std::system_category(), "Failed to create base cpu cgroup dir");
+        }
+        if (mkdir(cpu_cgroup_path.c_str(), 0755) != 0 && errno != EEXIST) {
+            throw std::system_error(errno, std::system_category(), "Failed to create cpu cgroup dir");
+        }
+        write_cgroup_file(cpu_cgroup_path + "/cpu.shares", std::to_string(resources.cpu_shares));
+        write_cgroup_file(cpu_cgroup_path + "/cgroup.procs", std::to_string(pid));
+    }
+}
+
+// Cleans up cgroups for the container
+void cleanup_cgroups(const std::string& id) {
+    std::cout << "Cleaning up cgroups for container " << id << std::endl;
+    std::string mem_cgroup_path = CGROUP_BASE_PATH + "memory/my_runtime/" + id;
+    if (rmdir(mem_cgroup_path.c_str()) != 0 && errno != ENOENT) {
+        perror(("Failed to remove memory cgroup dir: " + mem_cgroup_path).c_str());
+    }
+    std::string cpu_cgroup_path = CGROUP_BASE_PATH + "cpu/my_runtime/" + id;
+    if (rmdir(cpu_cgroup_path.c_str()) != 0 && errno != ENOENT) {
+        perror(("Failed to remove cpu cgroup dir: " + cpu_cgroup_path).c_str());
+    }
+}
+
+
+// Entry point for the child process (container)
 int container_main(void* arg) {
     ContainerArgs* args = static_cast<ContainerArgs*>(arg);
 
-    // 1. 開始合図を待つ
+    // 1. Wait for the start signal from the parent process
     char buf;
     int fifo_fd = open(args->sync_fifo_path.c_str(), O_RDONLY);
     if (fifo_fd == -1) {
-        perror("FIFOのオープンに失敗(read)"); //PID異常ハンドリング
+        perror("Failed to open FIFO (read)");
         return 1;
     }
     if (read(fifo_fd, &buf, 1) <= 0) {
@@ -214,82 +296,73 @@ int container_main(void* arg) {
     }
     close(fifo_fd);
 
-    // 2. 環境設定
+    // 2. Set up the environment
     if (sethostname(args->hostname.c_str(), args->hostname.length()) != 0) {
-        perror("sethostnameに失敗"); return 1;
+        perror("sethostname failed"); return 1;
     }
-    // chrootの前にカレントディレクトリを移動
     if (chdir(args->rootfs_path.c_str()) != 0) {
-        perror("rootfsへのchdirに失敗"); return 1;
+        perror("chdir to rootfs failed"); return 1;
     }
     if (chroot(".") != 0) {
-        perror("chrootに失敗"); return 1;
+        perror("chroot failed"); return 1;
     }
     if (chdir("/") != 0) {
-        perror("ルートへのchdirに失敗"); return 1;
+        perror("chdir to / failed"); return 1;
     }
     if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
-        perror("procのマウントに失敗");
+        perror("Failed to mount proc");
     }
-    // rootfsをreadonlyにする場合
     if (args->rootfs_readonly) {
         if (mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL) != 0) {
-            perror("rootfsの再マウント(readonly)に失敗");
+            perror("Failed to remount rootfs as readonly");
         }
     }
 
-    // 3. 指定されたコマンドの実行
+    // 3. Execute the specified command
     if (execvp(args->argv[0], args->argv)) {
-        perror("execvpに失敗");
+        perror("execvp failed");
     }
 
-    return 1; // execvpが失敗した場合のみ Todo: エラーハンドリング追加
+    return 1; // Todo: ハンドリングの追加/エラーメッセージの追加
 }
 
-// OCI `create` コマンド
+// OCI `create` command
 void create_container(const std::string& id, const std::string& bundle_path) {
     OCIConfig config;
     try {
         config = load_config(bundle_path);
     } catch (const std::exception& e) {
-        std::cerr << "設定ファイルの処理中にエラーが発生: " << e.what() << std::endl;
+        std::cerr << "Error processing config file: " << e.what() << std::endl;
         return;
     }
 
     std::string container_dir = STATE_BASE_PATH + id;
     if (mkdir(container_dir.c_str(), 0755) != 0 && errno != EEXIST) {
-        perror("コンテナディレクトリの作成に失敗"); return;
+        perror("Failed to create container directory"); return;
     }
 
     std::string fifo_path = get_fifo_path(id);
     if (mkfifo(fifo_path.c_str(), 0666) == -1 && errno != EEXIST) {
-        perror("mkfifoに失敗"); return;
+        perror("mkfifo failed"); return;
     }
 
-    // config.jsonから読み込んだ値でContainerArgsを準備
     ContainerArgs args;
     args.sync_fifo_path = fifo_path;
     args.rootfs_path = bundle_path + "/" + config.root.path;
     args.hostname = config.hostname;
     args.rootfs_readonly = config.root.readonly;
 
-    // execvpのためにコマンド引数をchar*の配列に変換
     std::vector<char*> argv_vec;
     for (const auto& arg_str : config.process.args) {
         argv_vec.push_back(const_cast<char*>(arg_str.c_str()));
     }
-    argv_vec.push_back(nullptr); // 配列の終端
+    argv_vec.push_back(nullptr);
     args.argv = argv_vec.data();
 
-    // config.jsonから読み込んだ名前空間でcloneフラグを設定
     int flags = SIGCHLD;
     std::map<std::string, int> ns_map = {
-            {"pid", CLONE_NEWPID},
-            {"uts", CLONE_NEWUTS},
-            {"ipc", CLONE_NEWIPC},
-            {"net", CLONE_NEWNET},
-            {"mnt", CLONE_NEWNS},
-            {"user", CLONE_NEWUSER},
+            {"pid", CLONE_NEWPID}, {"uts", CLONE_NEWUTS}, {"ipc", CLONE_NEWIPC},
+            {"net", CLONE_NEWNET}, {"mnt", CLONE_NEWNS}, {"user", CLONE_NEWUSER},
             {"cgroup", CLONE_NEWCGROUP}
     };
     for (const auto& ns : config.linux.namespaces) {
@@ -302,13 +375,27 @@ void create_container(const std::string& id, const std::string& bundle_path) {
     char* stack_top = stack + STACK_SIZE;
 
     pid_t pid = clone(container_main, stack_top, flags, &args);
+    delete[] stack;
 
     if (pid == -1) {
-        perror("cloneに失敗");
-        delete[] stack;
+        perror("clone failed");
         unlink(fifo_path.c_str());
         return;
     }
+
+    // Cgroupの設定系
+    try {
+        setup_cgroups(pid, id, config.linux.resources);
+    } catch (const std::exception& e) {
+        std::cerr << "Error setting up cgroups: " << e.what() << std::endl;
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        cleanup_cgroups(id);
+        unlink(fifo_path.c_str());
+        rmdir(container_dir.c_str());
+        return;
+    }
+    // ここまで
 
     ContainerState state;
     state.id = id;
@@ -317,14 +404,15 @@ void create_container(const std::string& id, const std::string& bundle_path) {
     state.bundle_path = bundle_path;
 
     if (!save_state(state)) {
-        std::cerr << "状態の保存に失敗しました。" << std::endl;
+        std::cerr << "Failed to save state." << std::endl;
         kill(pid, SIGKILL);
+        cleanup_cgroups(id); //不正なCgroupの削除
     } else {
-        std::cout << "コンテナ '" << id << "' を作成しました。状態: created, PID: " << pid << std::endl;
+        std::cout << "Container '" << id << "' created. Status: created, PID: " << pid << std::endl;
     }
 }
 
-// OCI `start` コマンド
+// OCI `start` command
 void start_container(const std::string& id, bool attach) {
     ContainerState state;
     try {
@@ -334,19 +422,19 @@ void start_container(const std::string& id, bool attach) {
     }
 
     if (state.status != "created") {
-        std::cerr << "エラー: コンテナは 'created' 状態ではありません (現在: " << state.status << ")" << std::endl;
+        std::cerr << "Error: Container is not in 'created' state (current: " << state.status << ")" << std::endl;
         return;
     }
 
     std::string fifo_path = get_fifo_path(id);
     int fifo_fd = open(fifo_path.c_str(), O_WRONLY);
     if (fifo_fd == -1) {
-        perror("FIFOのオープンに失敗(write)");
+        perror("Failed to open FIFO (write)");
         return;
     }
 
     if (write(fifo_fd, "1", 1) != 1) {
-        perror("FIFOへの書き込みに失敗");
+        perror("Failed to write to FIFO");
         close(fifo_fd);
         return;
     }
@@ -354,20 +442,32 @@ void start_container(const std::string& id, bool attach) {
 
     state.status = "running";
     save_state(state);
-    std::cout << "コンテナ '" << id << "' を開始しました。" << std::endl;
+    std::cout << "Container '" << id << "' started." << std::endl;
 
     if (attach) {
-        std::cout << "コンテナにアタッチします。終了するには 'exit' を入力するか、Ctrl+Dを押してください。" << std::endl;
-        int status;
-        waitpid(state.pid, &status, 0);
+        std::cout << "Attaching to container (PID: " << state.pid << ")..." << std::endl;
 
-        std::cout << "コンテナ '" << id << "' が終了しました。" << std::endl;
-        state.status = "stopped";
-        save_state(state);
+        while (true) {
+            // Check if the process is still running
+            if (kill(state.pid, 0) != 0) {
+                if (errno == ESRCH) {
+                    // Process no longer exists
+                    std::cout << "Container '" << id << "' has exited." << std::endl;
+                    state.status = "stopped";
+                    save_state(state);
+                    break;
+                } else {
+                    perror("Error checking container status");
+                    break;
+                }
+            }
+            // Sleep briefly to avoid busy-waiting
+            usleep(100000); // 100ms
+        }
     }
 }
 
-// OCI `state` コマンド
+// OCI `state` command
 void show_state(const std::string& id) {
     try {
         ContainerState state = load_state(id);
@@ -383,7 +483,7 @@ void show_state(const std::string& id) {
     }
 }
 
-// OCI `kill` コマンド
+// OCI `kill` command
 void kill_container(const std::string& id, int signal) {
     ContainerState state;
     try {
@@ -393,24 +493,24 @@ void kill_container(const std::string& id, int signal) {
     }
 
     if (state.status != "running" && state.status != "created") {
-        std::cerr << "エラー: コンテナは実行中または作成済みではありません。" << std::endl;
+        std::cerr << "Error: Container is not running or created." << std::endl;
         return;
     }
 
     if (kill(state.pid, signal) == 0) {
-        std::cout << "シグナル " << signal << " をプロセス " << state.pid << " に送信しました。" << std::endl;
+        std::cout << "Sent signal " << signal << " to process " << state.pid << std::endl;
         if (signal == SIGKILL || signal == SIGTERM) {
             waitpid(state.pid, NULL, 0);
             state.status = "stopped";
             save_state(state);
-            std::cout << "コンテナ '" << id << "' は停止しました。" << std::endl;
+            std::cout << "Container '" << id << "' is stopped." << std::endl;
         }
     } else {
-        perror("killに失敗");
+        perror("kill failed");
     }
 }
 
-// OCI `delete` コマンド
+// OCI `delete` command
 void delete_container(const std::string& id) {
     ContainerState state;
     try {
@@ -421,7 +521,7 @@ void delete_container(const std::string& id) {
 
     if (state.status != "stopped") {
         if (state.pid != -1 && kill(state.pid, 0) == 0) {
-            std::cerr << "エラー: コンテナはまだ実行中です。先に kill してください。" << std::endl;
+            std::cerr << "Error: Container is still running. Kill it first." << std::endl;
             return;
         }
         state.status = "stopped";
@@ -434,31 +534,33 @@ void delete_container(const std::string& id) {
 
     unlink(fifo_file.c_str());
     if (remove(state_file.c_str()) != 0) {
-        // エラーでも処理を続行
-        perror("状態ファイルの削除に失敗");
+        perror("Failed to delete state file");
     }
     if (rmdir(container_path.c_str()) != 0) {
-        perror("状態ディレクトリの削除に失敗");
+        perror("Failed to delete state directory");
     }
-    std::cout << "コンテナ '" << id << "' を削除しました。" << std::endl;
+
+    cleanup_cgroups(id);
+
+    std::cout << "Container '" << id << "' deleted." << std::endl;
 }
 
 void print_usage(const char* prog) {
-    std::cerr << "使い方: " << prog << " <command> [args...]\n"
+    std::cerr << "Usage: " << prog << " <command> [args...]\n"
               << "\n"
-              << "コマンド:\n"
-              << "  create <id> <bundle-path>      コンテナを作成する\n"
-              << "  start  [-a|--attach] <id>      作成されたコンテナを開始する\n"
-              << "                                 -a, --attach: コンテナにアタッチし対話的に操作する\n"
-              << "  state  <id>                    コンテナの状態を表示する\n"
-              << "  kill   <id> [signal]           コンテナにシグナルを送る (デフォルト: SIGTERM)\n"
-              << "  delete <id>                    停止したコンテナを削除する\n"
+              << "Commands:\n"
+              << "  create <id> <bundle-path>      Create a container\n"
+              << "  start  [-a|--attach] <id>      Start a created container\n"
+              << "                                 -a, --attach: Attach to the container for interactive use\n"
+              << "  state  <id>                    Show the state of a container\n"
+              << "  kill   <id> [signal]           Send a signal to a container (default: SIGTERM)\n"
+              << "  delete <id>                    Delete a stopped container\n"
               << std::endl;
 }
 
 int main(int argc, char* argv[]) {
     if (getuid() != 0) {
-        std::cerr << "エラー: このプログラムはroot権限で実行する必要があります。" << std::endl;
+        std::cerr << "Error: This program must be run as root." << std::endl;
         return 1;
     }
 
@@ -502,7 +604,7 @@ int main(int argc, char* argv[]) {
         if (argc != 3) { print_usage(argv[0]); return 1; }
         delete_container(argv[2]);
     } else {
-        std::cerr << "エラー: 不明なコマンド '" << command << "'" << std::endl;
+        std::cerr << "Error: Unknown command '" << command << "'" << std::endl;
         print_usage(argv[0]);
         return 1;
     }
