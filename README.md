@@ -148,13 +148,7 @@ OCI仕様のconfig.jsonに対応する構造体：
 - C++11標準を使用
 - nlohmann/jsonライブラリでJSONの処理を簡潔に実装
 - Linux固有のシステムコールを多用するため、Linux環境でのみ動作
-
-## ライセンス
-[プロジェクトのライセンスを記載]
-
-## 貢献
-プルリクエストやイシューの報告を歓迎します。
-
+- x86もしくはAMD64でのみ動作(ARM未対応)
 ## 参考資料
 - [OCI Runtime Specification](https://github.com/opencontainers/runtime-spec)
 - [Linux Namespaces](https://man7.org/linux/man-pages/man7/namespaces.7.html)
