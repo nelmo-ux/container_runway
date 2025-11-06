@@ -5,8 +5,10 @@ SRC = main.cpp
 TARGET = runtime
 PREFIX = /usr/local
 BIN_DIR = $(PREFIX)/bin
+TEST_DIR = test
+TEST_TARGET = $(TEST_DIR)/runtime_tests
 
-.PHONY: all clean install uninstall help
+.PHONY: all clean install uninstall help test
 
 all: $(TARGET)
 
@@ -14,9 +16,16 @@ $(TARGET): $(SRC)
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRC) $(LDFLAGS)
 	@echo "Executable '$(TARGET)' has made."
 
+$(TEST_TARGET): $(TEST_DIR)/runtime_tests.cpp $(SRC)
+	$(CXX) $(CXXFLAGS) -o $(TEST_TARGET) $(TEST_DIR)/runtime_tests.cpp $(LDFLAGS)
+	@echo "Test binary '$(TEST_TARGET)' has made."
+
+test: $(TEST_TARGET)
+	./$(TEST_TARGET)
+
 clean:
 	@echo "Deleting built OBJ"
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(TEST_TARGET)
 	@echo "Completed"
 
 install: $(TARGET)
@@ -37,5 +46,5 @@ help:
 	@echo "  make clean     - Delete built OBJ"
 	@echo "  make install   - Install the program to /usr/local/bin, Run with root"
 	@echo "  make uninstall - Delete the Programs, Run with root access."
+	@echo "  make test      - Build and run unit tests"
 	@echo "  make help      - Show this help"
-

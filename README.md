@@ -10,6 +10,10 @@ Container Runwayは、OCI (Open Container Initiative) 仕様に準拠した軽�
 - **読み取り専用ルートファイルシステム**: オプションでルートファイルシステムを読み取り専用にマウント
 - **状態管理**: コンテナの状態をJSON形式で保存・管理
 - **同期メカニズム**: 名前付きパイプ(FIFO)を使用したプロセス間同期
+- **OCIフック対応**: createRuntime / createContainer / prestart / startContainer / poststart / poststop フックを順守し、ライフサイクルごとの拡張に対応
+- **CLI拡張**: `exec`、`pause`、`resume`、`ps`、`events`などの`runc`互換コマンドを実装
+- **イベント・統計出力**: 状態遷移をイベントログに記録し、`events --stats`でCPU/メモリ統計を取得可能
+- **TTY/コンソール対応**: `process.terminal` と `--console-socket` を指定すると擬似TTYを割り当て、外部にコンソールFDを引き渡し可能
 
 ## 技術スタック
 - **言語**: C++11
@@ -19,6 +23,8 @@ Container Runwayは、OCI (Open Container Initiative) 仕様に準拠した軽�
 
 ## プロジェクト構成
 ```
+
+`config.json`ではOCI仕様に沿った`hooks`セクションも利用できます。`createRuntime`や`prestart`などのフックを定義すると、ランタイムが該当フェーズで指定コマンドを実行します。
 container-runway/
 ├── main.cpp              # メインソースコード（コンテナランタイムの実装）
 ├── json.hpp              # JSONパーサライブラリ（nlohmann/json）
@@ -68,7 +74,7 @@ make
 ### 基本的な使い方
 ```bash
 # コンテナの作成
-sudo ./runtime create <container-id> <bundle-path>
+sudo ./runtime create --bundle <bundle-path> --pid-file <pid-file> <container-id>
 
 # コンテナの開始
 sudo ./runtime start <container-id>
@@ -76,8 +82,32 @@ sudo ./runtime start <container-id>
 # コンテナの状態確認
 sudo ./runtime state <container-id>
 
+# コンテナ内で追加プロセスを実行
+sudo ./runtime exec [--process <process.json>] <container-id> <command> [args...]
+
+# コンテナの一時停止と再開
+sudo ./runtime pause <container-id>
+sudo ./runtime resume <container-id>
+
+# コンテナ内プロセス一覧表示
+sudo ./runtime ps <container-id>
+
+# イベントログ/統計の取得
+sudo ./runtime events [--follow] <container-id>
+sudo ./runtime events --stats [--follow] [--interval <ms>] <container-id>
+
 # コンテナの削除
-sudo ./runtime delete <container-id>
+sudo ./runtime delete [--force] <container-id>
+```
+
+### グローバルオプション
+```bash
+sudo ./runtime \
+  --log /run/containerd/logs/<id>.log \
+  --log-format json \
+  --root /run/containerd/runc/k8s.io \
+  --systemd-cgroup \
+  create --bundle <bundle-path> --pid-file <pid-file> <container-id>
 ```
 
 ### config.jsonの例
@@ -125,12 +155,16 @@ OCI仕様のconfig.jsonに対応する構造体：
 - `linux`: Linux固有の設定（名前空間等）
 
 ## 状態管理
-コンテナの状態は`/run/runtime/<container-id>/state.json`に保存されます。
+コンテナの状態は既定で`/run/mruntime/<container-id>/state.json`に保存されます。`--root`オプションを指定すると、実行時状態ディレクトリを変更できます。
 
 ## セキュリティ考慮事項
 - ルート権限が必要（名前空間操作とchrootのため）
 - 読み取り専用ルートファイルシステムオプションをサポート
 - 適切な権限管理が必要
+
+## テスト
+- `make test`: 標準ライブラリのみで動作する軽量ユニットテストを実行
+- `cmake -S ctest -B ctest/build && cmake --build ctest/build && ctest --test-dir ctest/build`: GoogleTestベースの検証を実行
 
 ## 今後の改善点
 - エラーハンドリングの強化

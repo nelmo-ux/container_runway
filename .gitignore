@@ -1,0 +1,7 @@
+cmake-build-debug/
+go/
+go1*
+buildtmp/
+node_modules/
+*.md
+
