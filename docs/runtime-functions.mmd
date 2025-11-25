@@ -1,0 +1,296 @@
+```mermaid
+flowchart LR
+    %% ---------- Styles ----------
+    classDef cli fill:#dbeafe,stroke:#2563eb,color:#0f172a;
+    classDef command fill:#fef3c7,stroke:#f59e0b,color:#78350f;
+    classDef container fill:#fce7f3,stroke:#db2777,color:#831843;
+    classDef config fill:#cffafe,stroke:#06b6d4,color:#0f172a;
+    classDef fs fill:#ede9fe,stroke:#7c3aed,color:#2e1065;
+    classDef console fill:#f3e8ff,stroke:#a855f7,color:#581c87;
+    classDef hooks fill:#fee2e2,stroke:#dc2626,color:#7f1d1d;
+    classDef isolation fill:#fde68a,stroke:#d97706,color:#78350f;
+    classDef process fill:#f1f5f9,stroke:#64748b,color:#0f172a;
+    classDef options fill:#dcfce7,stroke:#16a34a,color:#065f46;
+    classDef state fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e;
+
+    %% ---------- CLI & Option Parsing ----------
+    subgraph CLI_Dispatch["CLI & Option Parsing"]
+        main_fn["main\nParses global flags, configures logging/root dir, dispatches commands"]:::cli
+        print_usage_fn["print_usage\nShows help/command synopsis"]:::cli
+        parse_create_fn["parse_create_options\nHandles create/run CLI flags & container id"]:::cli
+        parse_exec_fn["parse_exec_options\nReads exec-specific options (process.json, tty, detach)"]:::cli
+        parse_events_fn["parse_events_options\nParses --follow/--stats/--interval flags"]:::cli
+    end
+
+    %% ---------- Lifecycle & Management Commands ----------
+    subgraph Lifecycle["Lifecycle & Management Commands"]
+        create_fn["create_container\nLoads OCI bundle, sets namespaces/cgroups, clones container_main, persists state"]:::command
+        run_fn["run_container_command\nConvenience wrapper for create → start → wait → delete"]:::command
+        start_fn["start_container\nSignals FIFO to start child, runs pre/post hooks, updates state"]:::command
+        exec_fn["exec_container\nJoins namespaces of running init and forks execvp() for an extra process"]:::command
+        pause_fn["pause_container\nSIGSTOP entire process tree, mark state paused"]:::command
+        resume_fn["resume_container\nSIGCONT tree and restore running status"]:::command
+        ps_fn["list_container_processes\nLists /proc/<pid>/comm for tree rooted at init pid"]:::command
+        events_fn["events_command\nStreams events log or emits stats via /proc polling"]:::command
+        state_fn["show_state\nReads state file, refreshes stopped status, prints JSON"]:::command
+        kill_fn["kill_container\nSends signals to init pid and records lifecycle events"]:::command
+        delete_fn["delete_container\nRuns poststop hooks, removes state/cgroup artifacts"]:::command
+    end
+
+    %% ---------- Container Init / Helpers ----------
+    subgraph ContainerInit["Child Runtime & Helpers"]
+        container_main_fn["container_main\nRuns inside cloned child; waits on FIFO, sets up mounts/rootfs/env, execs workload"]:::container
+        collect_stats_fn["collect_proc_stats\nReads /proc/<pid> stats & smaps to build CPU/memory metrics"]:::container
+    end
+
+    %% ---------- Config Parsing Module ----------
+    subgraph ConfigModule["runtime/config.*"]
+        from_json_process_fn["from_json(ProcessConfig)\nMaps process.args/env/cwd/terminal"]:::config
+        from_json_root_fn["from_json(RootConfig)\nReads root.path and readonly flag"]:::config
+        from_json_ns_fn["from_json(LinuxNamespaceConfig)\nParses namespace type/path pairs"]:::config
+        from_json_map_fn["from_json(LinuxIDMapping)\nMaps uid/gid ranges"]:::config
+        from_json_resources_fn["from_json(LinuxResourcesConfig)\nExtracts memory/cpu hints"]:::config
+        from_json_linux_fn["from_json(LinuxConfig)\nAggregates namespaces, mappings, resources, paths"]:::config
+        from_json_mount_fn["from_json(MountConfig)\nCaptures destination/source/type/options"]:::config
+        from_json_hook_fn["from_json(HookConfig)\nNormalizes hook path/args/env/timeout"]:::config
+        from_json_hooks_fn["from_json(HooksConfig)\nBuckets hooks per lifecycle stage"]:::config
+        from_json_config_fn["from_json(OCIConfig)\nComposes entire OCI config object"]:::config
+        load_config_fn["load_config\nOpens bundle/config.json and deserializes OCIConfig"]:::config
+        resolve_abs_fn["resolve_absolute_path\nRealpath helper for bundle-relative inputs"]:::config
+    end
+
+    %% ---------- Filesystem Utilities ----------
+    subgraph FilesystemModule["runtime/filesystem.*"]
+        ensure_directory_fn["ensure_directory\nRecursively mkdir -p a directory"]:::fs
+        ensure_parent_dir_fn["ensure_parent_directory\nEnsures parent dir exists before file creation"]:::fs
+        ensure_file_fn["ensure_file\nCreates regular file if missing"]:::fs
+        ensure_runtime_root_fn["ensure_runtime_root_directory\nGuarantees writable state root (with fallback)"]:::fs
+        container_abs_path_fn["container_absolute_path\nTranslate container-relative path within rootfs"]:::fs
+        propagation_flag_fn["propagation_flag_from_string\nMap 'rshared' etc. to mount flags"]:::fs
+        apply_mount_prop_fn["apply_mount_propagation\nApply propagation flag to mount point"]:::fs
+        parse_mount_opts_fn["parse_mount_options\nSplit mount options into flags/data"]:::fs
+        join_strings_fn["join_strings\nUtility joiner used for mount/data + logging"]:::fs
+    end
+
+    %% ---------- Console Handling ----------
+    subgraph ConsoleModule["runtime/console.*"]
+        close_console_pair_fn["close_console_pair\nCloses pts master/slave fds safely"]:::console
+        allocate_console_pair_fn["allocate_console_pair\nCreates new PTY pair for terminal mode"]:::console
+        send_console_fd_fn["send_console_fd\nSCM_RIGHTS send of console master to socket"]:::console
+    end
+
+    %% ---------- Hooks ----------
+    subgraph HooksModule["runtime/hooks.*"]
+        run_hook_sequence_fn["run_hook_sequence\nFork/exec hooks with ContainerState JSON + timeout enforcement"]:::hooks
+    end
+
+    %% ---------- Isolation / Namespace helpers ----------
+    subgraph IsolationModule["runtime/isolation.*"]
+        cpu_weight_fn["cpu_shares_to_weight\nTranslate OCI cpu.shares into v2 weight"]:::isolation
+        setup_cgroups_fn["setup_cgroups\nCreate cgroup dirs, apply limits, attach pid"]:::isolation
+        cleanup_cgroups_fn["cleanup_cgroups\nRemove per-container cgroup directories"]:::isolation
+        configure_userns_fn["configure_user_namespace\nWrite uid/gid maps + deny setgroups"]:::isolation
+    end
+
+    %% ---------- Process Utilities ----------
+    subgraph ProcessModule["runtime/process.*"]
+        wait_for_process_fn["wait_for_process\nwaitpid with timeout+killing fallback"]:::process
+        collect_process_tree_fn["collect_process_tree\nBFS through /proc/.../children to list descendant pids"]:::process
+    end
+
+    %% ---------- Options & Logging ----------
+    subgraph OptionsModule["runtime/options.*"]
+        configure_log_dest_fn["configure_log_destination\nRedirect stderr to file"]:::options
+        log_debug_fn["log_debug\nConditional debug logging helper"]:::options
+        state_base_path_fn["state_base_path\nReturns <root_path>/<id>/ prefix"]:::options
+        fallback_state_root_fn["fallback_state_root\n/tmp-based fallback when /run unavailable"]:::options
+        default_state_root_fn["default_state_root\nEvaluates preferred state root (root vs XDG runtime)"]:::options
+    end
+
+    %% ---------- State serialization & events ----------
+    subgraph StateModule["runtime/state.*"]
+        to_json_object_fn["ContainerState::to_json_object\nBuilds canonical JSON map"]:::state
+        to_json_fn["ContainerState::to_json\nPretty-prints JSON text via to_json_object"]:::state
+        from_json_state_fn["ContainerState::from_json\nParse saved state.json back into struct"]:::state
+        save_state_fn["save_state\nPersist ContainerState to <root>/<id>/state.json"]:::state
+        load_state_fn["load_state\nRead ContainerState from disk"]:::state
+        get_fifo_path_fn["get_fifo_path\nCompute sync FIFO location per id"]:::state
+        events_file_path_fn["events_file_path\nCompute events.log path"]:::state
+        iso8601_now_fn["iso8601_now\nTimestamp helper shared by events/hooks"]:::state
+        record_event_fn["record_event\nAppend typed event entry to events.log"]:::state
+        record_state_event_fn["record_state_event\nEmit high-level state transitions via record_event"]:::state
+        write_pid_file_fn["write_pid_file\nPersist pid into user-provided file"]:::state
+    end
+
+    %% ---------- Edges: CLI flow ----------
+    main_fn --> configure_log_dest_fn
+    main_fn --> default_state_root_fn
+    main_fn --> ensure_runtime_root_fn
+    main_fn --> parse_create_fn
+    main_fn --> parse_exec_fn
+    main_fn --> parse_events_fn
+    main_fn --> create_fn
+    main_fn --> run_fn
+    main_fn --> start_fn
+    main_fn --> state_fn
+    main_fn --> exec_fn
+    main_fn --> pause_fn
+    main_fn --> resume_fn
+    main_fn --> ps_fn
+    main_fn --> events_fn
+    main_fn --> kill_fn
+    main_fn --> delete_fn
+    main_fn --> print_usage_fn
+    parse_create_fn --> create_fn
+    parse_create_fn --> run_fn
+    parse_exec_fn --> exec_fn
+    parse_events_fn --> events_fn
+
+    %% ---------- Command relationships ----------
+    run_fn --> create_fn
+    run_fn --> start_fn
+    run_fn --> load_state_fn
+    run_fn --> save_state_fn
+    run_fn --> delete_fn
+
+    create_fn --> load_config_fn
+    create_fn --> resolve_abs_fn
+    create_fn -. "clone()" .-> container_main_fn
+    create_fn --> run_hook_sequence_fn
+    create_fn --> setup_cgroups_fn
+    create_fn --> configure_userns_fn
+    create_fn --> save_state_fn
+    create_fn --> record_state_event_fn
+    create_fn --> write_pid_file_fn
+    create_fn --> get_fifo_path_fn
+    create_fn --> allocate_console_pair_fn
+    create_fn --> send_console_fd_fn
+    create_fn --> close_console_pair_fn
+    create_fn --> record_event_fn
+
+    start_fn --> load_state_fn
+    start_fn --> load_config_fn
+    start_fn --> run_hook_sequence_fn
+    start_fn --> get_fifo_path_fn
+    start_fn --> save_state_fn
+    start_fn --> record_state_event_fn
+    start_fn --> record_event_fn
+
+    exec_fn --> load_state_fn
+    exec_fn --> load_config_fn
+    exec_fn --> write_pid_file_fn
+    exec_fn --> record_event_fn
+    exec_fn --> join_strings_fn
+
+    pause_fn --> load_state_fn
+    pause_fn --> collect_process_tree_fn
+    pause_fn --> save_state_fn
+    pause_fn --> record_state_event_fn
+    pause_fn --> record_event_fn
+
+    resume_fn --> load_state_fn
+    resume_fn --> collect_process_tree_fn
+    resume_fn --> save_state_fn
+    resume_fn --> record_state_event_fn
+    resume_fn --> record_event_fn
+
+    ps_fn --> load_state_fn
+    ps_fn --> collect_process_tree_fn
+
+    events_fn --> load_state_fn
+    events_fn --> collect_stats_fn
+    events_fn --> events_file_path_fn
+    events_fn --> iso8601_now_fn
+
+    state_fn --> load_state_fn
+    state_fn --> save_state_fn
+    state_fn --> to_json_fn
+
+    kill_fn --> load_state_fn
+    kill_fn --> record_event_fn
+    kill_fn --> save_state_fn
+    kill_fn --> record_state_event_fn
+
+    delete_fn --> load_state_fn
+    delete_fn --> load_config_fn
+    delete_fn --> run_hook_sequence_fn
+    delete_fn --> get_fifo_path_fn
+    delete_fn --> events_file_path_fn
+    delete_fn --> cleanup_cgroups_fn
+    delete_fn --> record_event_fn
+    delete_fn --> save_state_fn
+
+    %% ---------- Container entry + stats helpers ----------
+    container_main_fn --> apply_mount_prop_fn
+    container_main_fn --> ensure_directory_fn
+    container_main_fn --> ensure_file_fn
+    container_main_fn --> container_abs_path_fn
+    container_main_fn --> parse_mount_opts_fn
+
+    parse_mount_opts_fn --> join_strings_fn
+    apply_mount_prop_fn --> propagation_flag_fn
+
+    collect_stats_fn --> collect_process_tree_fn
+    collect_stats_fn --> iso8601_now_fn
+
+    %% ---------- Config edges ----------
+    load_config_fn --> from_json_config_fn
+    from_json_config_fn --> from_json_process_fn
+    from_json_config_fn --> from_json_root_fn
+    from_json_config_fn --> from_json_linux_fn
+    from_json_config_fn --> from_json_mount_fn
+    from_json_config_fn --> from_json_hook_fn
+    from_json_config_fn --> from_json_hooks_fn
+    from_json_linux_fn --> from_json_ns_fn
+    from_json_linux_fn --> from_json_resources_fn
+    from_json_linux_fn --> from_json_map_fn
+
+    %% ---------- Console edges ----------
+    allocate_console_pair_fn --> close_console_pair_fn
+    send_console_fd_fn --> close_console_pair_fn
+
+    %% ---------- Hooks edges ----------
+    run_hook_sequence_fn --> wait_for_process_fn
+    run_hook_sequence_fn --> iso8601_now_fn
+    run_hook_sequence_fn --> to_json_fn
+
+    %% ---------- Isolation edges ----------
+    setup_cgroups_fn --> cpu_weight_fn
+    setup_cgroups_fn --> ensure_directory_fn
+    setup_cgroups_fn --> log_debug_fn
+    cleanup_cgroups_fn --> log_debug_fn
+
+    %% ---------- Filesystem edges ----------
+    ensure_file_fn --> ensure_parent_dir_fn
+    ensure_parent_dir_fn --> ensure_directory_fn
+    ensure_runtime_root_fn --> ensure_directory_fn
+    ensure_runtime_root_fn --> fallback_state_root_fn
+    ensure_runtime_root_fn --> default_state_root_fn
+    ensure_runtime_root_fn --> log_debug_fn
+
+    %% ---------- Options edges ----------
+    default_state_root_fn --> fallback_state_root_fn
+    save_state_fn --> state_base_path_fn
+    load_state_fn --> state_base_path_fn
+    get_fifo_path_fn --> state_base_path_fn
+    events_file_path_fn --> state_base_path_fn
+
+    %% ---------- State edges ----------
+    save_state_fn --> to_json_fn
+    to_json_fn --> to_json_object_fn
+    load_state_fn --> from_json_state_fn
+    record_event_fn --> iso8601_now_fn
+    record_event_fn --> events_file_path_fn
+    record_event_fn --> ensure_parent_dir_fn
+    record_state_event_fn --> record_event_fn
+    record_state_event_fn --> to_json_object_fn
+
+    %% ---------- Misc ----------
+    create_fn --> log_debug_fn
+    start_fn --> log_debug_fn
+    pause_fn --> log_debug_fn
+    resume_fn --> log_debug_fn
+    delete_fn --> log_debug_fn
+    ensure_runtime_root_fn -. influences .-> state_base_path_fn
+```
+```
