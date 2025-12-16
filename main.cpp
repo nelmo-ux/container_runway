@@ -1647,12 +1647,14 @@ void kill_container(const std::string& id, int signal) {
         return;
     }
 
+    // Send signal to the process and all its children
     if (kill(state.pid, signal) == 0) {
         log_debug("Sent signal " + std::to_string(signal) + " to process " + std::to_string(state.pid));
         record_event(id, "signal", json{{"signal", signal}});
+
+        // For termination signals, just mark as stopped
+        // Don't wait - the process may be in a PID namespace and we can't wait for it
         if (signal == SIGKILL || signal == SIGTERM) {
-            // Don't wait here - Docker will handle the wait
-            // Just mark as stopped immediately
             state.status = "stopped";
             if (!save_state(state)) {
                 std::cerr << "Failed to persist stopped state for container '" << id << "'" << std::endl;
@@ -1661,7 +1663,7 @@ void kill_container(const std::string& id, int signal) {
             log_debug("Container '" + id + "' is stopped.");
         }
     } else {
-        // If kill failed, the process may already be dead
+        // If kill failed, check if process is already dead
         if (errno == ESRCH) {
             state.status = "stopped";
             save_state(state);
