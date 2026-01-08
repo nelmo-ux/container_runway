@@ -654,17 +654,30 @@ void create_container(const CreateOptions& options) {
         }
     }
 
+    // Create a pipe to communicate the real container PID from child to parent
+    // This is needed because when PID namespace is used, the actual container
+    // process is a grandchild, and we need its PID for exec to work correctly
+    int pid_pipe[2];
+    if (pipe(pid_pipe) == -1) {
+        perror("pipe failed");
+        cleanup_failure("pipe", "Failed to create PID communication pipe");
+        return;
+    }
+
     // Use fork() instead of clone() to avoid C++ stdlib issues
     pid = fork();
 
     if (pid == -1) {
         perror("fork failed");
+        close(pid_pipe[0]);
+        close(pid_pipe[1]);
         cleanup_failure("fork", "Failed to fork container process");
         return;
     }
 
     if (pid == 0) {
         // Child process: setup namespaces then run container_main logic
+        close(pid_pipe[0]); // Close read end in child
 
         // Release unique_ptr ownership in child process only
         // fork() has created a proper copy of memory for us
@@ -703,10 +716,16 @@ void create_container(const CreateOptions& options) {
             pid_t inner_pid = fork();
             if (inner_pid == -1) {
                 perror("fork for PID namespace failed");
+                close(pid_pipe[1]);
                 _exit(1);
             }
             if (inner_pid != 0) {
-                // Middle process: wait for inner child then cleanup and exit
+                // Middle process: send inner_pid to parent, then wait and exit
+                // Write the inner child's PID to the parent
+                write(pid_pipe[1], &inner_pid, sizeof(inner_pid));
+                close(pid_pipe[1]);
+
+                // Wait for inner child then cleanup and exit
                 // We must delete args_ptr here before exiting
                 int status;
                 waitpid(inner_pid, &status, 0);
@@ -719,6 +738,12 @@ void create_container(const CreateOptions& options) {
                 _exit(1);
             }
             // Inner child is now PID 1 in the new PID namespace
+            close(pid_pipe[1]); // Inner child doesn't need the pipe
+        } else {
+            // No PID namespace: write 0 to indicate parent should use first child's pid
+            pid_t zero = 0;
+            write(pid_pipe[1], &zero, sizeof(zero));
+            close(pid_pipe[1]);
         }
 
         // Now run container_main logic
@@ -730,13 +755,33 @@ void create_container(const CreateOptions& options) {
     // args unique_ptr is still valid here and will be cleaned up automatically
     // when this function returns. fork() created a copy of memory for child.
 
+    close(pid_pipe[1]); // Close write end in parent
+
+    // Keep the first child's PID for user namespace setup
+    pid_t first_child_pid = pid;
+
+    // Read the real container PID from the child
+    // If PID namespace is used, this will be the inner (grandchild) PID
+    // If not, it will be 0 indicating we should use the first child's PID
+    pid_t real_container_pid = 0;
+    ssize_t n = read(pid_pipe[0], &real_container_pid, sizeof(real_container_pid));
+    close(pid_pipe[0]);
+
+    if (n == sizeof(real_container_pid) && real_container_pid != 0) {
+        // Use the inner child's PID for state.pid (for PID namespace case)
+        // This is the process that's actually in the new PID namespace
+        pid = real_container_pid;
+    }
+    // else: keep pid as the first child's PID
+
     // Close namespace file descriptors in parent
     for (auto& ns_fd : args->join_namespaces) {
         close(ns_fd.first);
     }
     args->join_namespaces.clear();
 
-    if (!configure_user_namespace(pid, creates_new_userns, uid_mappings, gid_mappings)) {
+    // User namespace setup must be done on the first child (the one that called unshare)
+    if (!configure_user_namespace(first_child_pid, creates_new_userns, uid_mappings, gid_mappings)) {
         cleanup_failure("userNamespace", "Failed to configure user namespace");
         return;
     }
@@ -1154,6 +1199,9 @@ int exec_container(const ExecOptions& options) {
         std::cerr << "Warning: --preserve-fds is not supported; ignoring request." << std::endl;
     }
 
+    log_debug("exec_container: loading state for container '" + options.id + "'");
+    log_debug("exec_container: state_base_path = '" + state_base_path() + "'");
+
     ContainerState state;
     try {
         state = load_state(options.id);
@@ -1161,6 +1209,8 @@ int exec_container(const ExecOptions& options) {
         std::cerr << e.what() << std::endl;
         return 1;
     }
+
+    log_debug("exec_container: loaded state, pid = " + std::to_string(state.pid) + ", status = " + state.status);
 
     if (state.status != "running") {
         std::cerr << "Error: Container must be running to exec (current: " << state.status << ")" << std::endl;
@@ -1217,50 +1267,71 @@ int exec_container(const ExecOptions& options) {
     }
 
     const std::vector<std::string> namespace_order = {"user", "mnt", "pid", "ipc", "uts", "net", "cgroup"};
-    std::vector<int> namespace_fds;
+    std::vector<std::pair<int, std::string>> namespace_fds;  // fd and name
     namespace_fds.reserve(namespace_order.size());
     std::string pid_str = std::to_string(state.pid);
+    log_debug("exec_container: opening namespaces for pid " + pid_str);
     for (const auto& ns_name : namespace_order) {
         std::string ns_path = "/proc/" + pid_str + "/ns/" + ns_name;
+        std::string self_ns_path = "/proc/self/ns/" + ns_name;
+
+        // Check if target namespace is the same as our current namespace
+        struct stat target_stat, self_stat;
+        if (stat(ns_path.c_str(), &target_stat) == 0 && stat(self_ns_path.c_str(), &self_stat) == 0) {
+            if (target_stat.st_ino == self_stat.st_ino && target_stat.st_dev == self_stat.st_dev) {
+                log_debug("exec_container: namespace " + ns_name + " is same as current, skipping");
+                continue;
+            }
+        }
+
         int fd = open(ns_path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd == -1) {
             if (errno == ENOENT) {
+                log_debug("exec_container: namespace " + ns_name + " not found, skipping");
                 continue;
             }
             perror(("Failed to open namespace " + ns_name).c_str());
-            for (int existing_fd : namespace_fds) {
-                close(existing_fd);
+            for (auto& ns_fd : namespace_fds) {
+                close(ns_fd.first);
             }
             return 1;
         }
-        namespace_fds.push_back(fd);
+        log_debug("exec_container: opened namespace " + ns_name + " (fd=" + std::to_string(fd) + ")");
+        namespace_fds.push_back({fd, ns_name});
     }
 
     pid_t child = fork();
     if (child == -1) {
         perror("fork failed");
-        for (int fd : namespace_fds) {
-            close(fd);
+        for (auto& ns_fd : namespace_fds) {
+            close(ns_fd.first);
         }
         return 1;
     }
 
     if (child == 0) {
-        for (int fd : namespace_fds) {
-            if (setns(fd, 0) != 0) {
-                perror("setns failed");
+        for (auto& ns_fd : namespace_fds) {
+            if (setns(ns_fd.first, 0) != 0) {
+                std::cerr << "setns failed for " << ns_fd.second << ": " << strerror(errno) << std::endl;
                 _exit(1);
             }
         }
-        for (int fd : namespace_fds) {
-            close(fd);
+        for (auto& ns_fd : namespace_fds) {
+            close(ns_fd.first);
         }
 
-        if (!process_cfg.cwd.empty()) {
-            if (chdir(process_cfg.cwd.c_str()) != 0) {
-                perror("Failed to change working directory for exec");
-                _exit(1);
-            }
+        // Change root to the container's root filesystem
+        std::string container_root = "/proc/" + pid_str + "/root";
+        if (chroot(container_root.c_str()) != 0) {
+            perror("chroot to container root failed");
+            _exit(1);
+        }
+
+        // After chroot, we need to chdir to avoid being outside the new root
+        std::string cwd = process_cfg.cwd.empty() ? "/" : process_cfg.cwd;
+        if (chdir(cwd.c_str()) != 0) {
+            perror("Failed to change working directory for exec");
+            _exit(1);
         }
 
         if (!process_cfg.env.empty()) {
@@ -1296,8 +1367,8 @@ int exec_container(const ExecOptions& options) {
         _exit(127);
     }
 
-    for (int fd : namespace_fds) {
-        close(fd);
+    for (auto& ns_fd : namespace_fds) {
+        close(ns_fd.first);
     }
 
     if (!options.pid_file.empty()) {
