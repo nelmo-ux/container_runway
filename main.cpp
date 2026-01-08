@@ -7,6 +7,7 @@
 #include <csignal>
 #include <chrono>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
 #include <getopt.h>
@@ -194,10 +195,11 @@ int container_main(void* arg) {
         if (mount(source, mount_target.c_str(), fs_type,
                   first_flags,
                   parsed.data.empty() ? nullptr : parsed.data.c_str()) != 0) {
-            // Ignore EBUSY errors for cgroup mounts - already mounted by Docker
-            if (errno == EBUSY && (destination.find("cgroup") != std::string::npos ||
-                                   (fs_type && std::string(fs_type).find("cgroup") != std::string::npos))) {
-                // Already mounted, continue
+            // Ignore EBUSY/EPERM errors for cgroup mounts - cgroup v2 may not allow mounting
+            bool is_cgroup = (destination.find("cgroup") != std::string::npos ||
+                             (fs_type && std::string(fs_type).find("cgroup") != std::string::npos));
+            if (is_cgroup && (errno == EBUSY || errno == EPERM || errno == EACCES)) {
+                // cgroup already mounted or not permitted, continue
             } else {
                 perror(("Failed to mount " + destination).c_str());
                 return 1;
@@ -996,6 +998,7 @@ void resume_container(const std::string& id);
 void list_container_processes(const std::string& id);
 void delete_container(const std::string& id, bool force);
 void events_command(const EventsOptions& options);
+void list_containers();
 
 int run_container_command(int argc, char* const argv[]) {
     CreateOptions options;
@@ -1617,6 +1620,251 @@ void events_command(const EventsOptions& options) {
         std::this_thread::sleep_for(std::chrono::milliseconds(options.interval_ms));
     }
 }
+// OCI `list` command
+void list_containers() {
+    std::string base_path = state_base_path();
+    DIR* dir = opendir(base_path.c_str());
+    if (!dir) {
+        // No containers exist yet or directory doesn't exist
+        std::cout << "ID\tPID\tSTATUS\tBUNDLE" << std::endl;
+        return;
+    }
+
+    struct ContainerInfo {
+        std::string id;
+        pid_t pid;
+        std::string status;
+        std::string bundle;
+    };
+    std::vector<ContainerInfo> containers;
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_type != DT_DIR) {
+            continue;
+        }
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") {
+            continue;
+        }
+
+        try {
+            ContainerState state = load_state(name);
+            // Check if process is still alive and update status if needed
+            if (state.pid > 0 && state.status != "stopped") {
+                if (kill(state.pid, 0) != 0 && errno == ESRCH) {
+                    state.status = "stopped";
+                }
+            }
+            ContainerInfo info;
+            info.id = state.id;
+            info.pid = state.pid;
+            info.status = state.status;
+            info.bundle = state.bundle_path;
+            containers.push_back(info);
+        } catch (const std::exception&) {
+            // Skip directories that don't have valid state
+            continue;
+        }
+    }
+    closedir(dir);
+
+    // Sort by container ID
+    std::sort(containers.begin(), containers.end(),
+              [](const ContainerInfo& a, const ContainerInfo& b) {
+                  return a.id < b.id;
+              });
+
+    std::cout << "ID\tPID\tSTATUS\tBUNDLE" << std::endl;
+    for (const auto& c : containers) {
+        std::cout << c.id << '\t'
+                  << c.pid << '\t'
+                  << c.status << '\t'
+                  << c.bundle << std::endl;
+    }
+}
+
+// OCI `spec` command - generate default config.json
+void generate_spec(const std::string& bundle_path, bool rootless) {
+    std::string config_path = bundle_path + "/config.json";
+
+    // Check if file already exists
+    struct stat st;
+    if (stat(config_path.c_str(), &st) == 0) {
+        std::cerr << "Error: config.json already exists at " << config_path << std::endl;
+        return;
+    }
+
+    json spec;
+    spec["ociVersion"] = "1.0.2";
+
+    // Root filesystem
+    spec["root"] = {
+        {"path", "rootfs"},
+        {"readonly", false}
+    };
+
+    // Process configuration
+    spec["process"] = {
+        {"terminal", true},
+        {"user", {
+            {"uid", 0},
+            {"gid", 0}
+        }},
+        {"args", json::array({"sh"})},
+        {"env", json::array({
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "TERM=xterm"
+        })},
+        {"cwd", "/"},
+        {"capabilities", {
+            {"bounding", json::array({
+                "CAP_AUDIT_WRITE",
+                "CAP_KILL",
+                "CAP_NET_BIND_SERVICE"
+            })},
+            {"effective", json::array({
+                "CAP_AUDIT_WRITE",
+                "CAP_KILL",
+                "CAP_NET_BIND_SERVICE"
+            })},
+            {"permitted", json::array({
+                "CAP_AUDIT_WRITE",
+                "CAP_KILL",
+                "CAP_NET_BIND_SERVICE"
+            })},
+            {"ambient", json::array()},
+            {"inheritable", json::array()}
+        }},
+        {"rlimits", json::array({
+            {{"type", "RLIMIT_NOFILE"}, {"hard", 1024}, {"soft", 1024}}
+        })},
+        {"noNewPrivileges", true}
+    };
+
+    // Hostname
+    spec["hostname"] = "runway";
+
+    // Mounts
+    spec["mounts"] = json::array({
+        {
+            {"destination", "/proc"},
+            {"type", "proc"},
+            {"source", "proc"}
+        },
+        {
+            {"destination", "/dev"},
+            {"type", "tmpfs"},
+            {"source", "tmpfs"},
+            {"options", json::array({"nosuid", "strictatime", "mode=755", "size=65536k"})}
+        },
+        {
+            {"destination", "/dev/pts"},
+            {"type", "devpts"},
+            {"source", "devpts"},
+            {"options", json::array({"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"})}
+        },
+        {
+            {"destination", "/dev/shm"},
+            {"type", "tmpfs"},
+            {"source", "shm"},
+            {"options", json::array({"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"})}
+        },
+        {
+            {"destination", "/dev/mqueue"},
+            {"type", "mqueue"},
+            {"source", "mqueue"},
+            {"options", json::array({"nosuid", "noexec", "nodev"})}
+        },
+        {
+            {"destination", "/sys"},
+            {"type", "sysfs"},
+            {"source", "sysfs"},
+            {"options", json::array({"nosuid", "noexec", "nodev", "ro"})}
+        },
+        {
+            {"destination", "/sys/fs/cgroup"},
+            {"type", "cgroup"},
+            {"source", "cgroup"},
+            {"options", json::array({"nosuid", "noexec", "nodev", "relatime", "ro"})}
+        }
+    });
+
+    // Linux-specific configuration
+    json linux_config;
+
+    // Namespaces
+    linux_config["namespaces"] = json::array({
+        {{"type", "pid"}},
+        {{"type", "network"}},
+        {{"type", "ipc"}},
+        {{"type", "uts"}},
+        {{"type", "mount"}}
+    });
+
+    if (rootless) {
+        linux_config["namespaces"].push_back({{"type", "user"}});
+        linux_config["uidMappings"] = json::array({
+            {{"containerID", 0}, {"hostID", getuid()}, {"size", 1}}
+        });
+        linux_config["gidMappings"] = json::array({
+            {{"containerID", 0}, {"hostID", getgid()}, {"size", 1}}
+        });
+    }
+
+    // Masked paths
+    linux_config["maskedPaths"] = json::array({
+        "/proc/acpi",
+        "/proc/asound",
+        "/proc/kcore",
+        "/proc/keys",
+        "/proc/latency_stats",
+        "/proc/timer_list",
+        "/proc/timer_stats",
+        "/proc/sched_debug",
+        "/sys/firmware",
+        "/proc/scsi"
+    });
+
+    // Readonly paths
+    linux_config["readonlyPaths"] = json::array({
+        "/proc/bus",
+        "/proc/fs",
+        "/proc/irq",
+        "/proc/sys",
+        "/proc/sysrq-trigger"
+    });
+
+    // Resources (cgroups)
+    linux_config["resources"] = {
+        {"devices", json::array({
+            {{"allow", false}, {"access", "rwm"}}
+        })}
+    };
+
+    spec["linux"] = linux_config;
+
+    // Write the config.json file
+    std::ofstream ofs(config_path);
+    if (!ofs) {
+        std::cerr << "Error: Failed to create " << config_path << std::endl;
+        return;
+    }
+
+    ofs << spec.dump(4) << std::endl;
+    ofs.close();
+
+    std::cout << "Created " << config_path << std::endl;
+
+    // Create rootfs directory if it doesn't exist
+    std::string rootfs_path = bundle_path + "/rootfs";
+    if (stat(rootfs_path.c_str(), &st) != 0) {
+        if (mkdir(rootfs_path.c_str(), 0755) == 0) {
+            std::cout << "Created " << rootfs_path << "/" << std::endl;
+        }
+    }
+}
+
 // OCI `state` command
 void show_state(const std::string& id) {
     try {
@@ -1807,6 +2055,8 @@ void print_usage(const char* prog) {
               << "  run [options] <id>      Create, start, and wait on a container\n"
               << "  start  [--attach] <id>  Start a created container\n"
               << "  state  <id>             Show the state of a container\n"
+              << "  list                    List all containers\n"
+              << "  spec   [options]        Generate a default OCI spec (config.json)\n"
               << "  features                Show supported OCI runtime features\n"
               << "  exec  [options] <id>    Execute a process inside a running container\n"
               << "  pause <id>              Pause all processes in a running container\n"
@@ -1820,6 +2070,10 @@ void print_usage(const char* prog) {
               << "  --bundle <path>         Set the OCI bundle directory (default: current directory)\n"
               << "  --pid-file <path>       Write the container init PID to the file\n"
               << "  --console-socket <path> Accepted for compatibility but ignored\n"
+              << "\n"
+              << "spec options:\n"
+              << "  --bundle <path>         Generate spec in the specified directory (default: current)\n"
+              << "  --rootless              Generate spec for rootless container\n"
               << "\n"
               << "exec options:\n"
               << "  --process <path>        Read process spec (process.json format)\n"
@@ -1954,6 +2208,36 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         show_state(command_argv[1]);
+    } else if (command == "list") {
+        if (command_argc != 1) {
+            std::cerr << "Error: list command takes no arguments." << std::endl;
+            return 1;
+        }
+        list_containers();
+        return 0;
+    } else if (command == "spec") {
+        std::string bundle = ".";
+        bool rootless = false;
+        for (int i = 1; i < command_argc; ++i) {
+            std::string arg = command_argv[i];
+            if (arg == "--bundle" || arg == "-b") {
+                if (i + 1 >= command_argc) {
+                    std::cerr << "Error: --bundle requires an argument." << std::endl;
+                    return 1;
+                }
+                bundle = command_argv[++i];
+            } else if (arg == "--rootless") {
+                rootless = true;
+            } else if (arg.rfind("-", 0) == 0) {
+                std::cerr << "Unknown spec option: " << arg << std::endl;
+                return 1;
+            } else {
+                std::cerr << "Error: Unexpected argument: " << arg << std::endl;
+                return 1;
+            }
+        }
+        generate_spec(bundle, rootless);
+        return 0;
     } else if (command == "features") {
         show_features();
         return 0;
