@@ -1,0 +1,42 @@
+--- a/main.cpp
++++ b/main.cpp
+@@ -635,10 +635,6 @@
+         }
+     }
+
+-    // Release unique_ptr ownership BEFORE fork to avoid double-free
+-    // After this, both parent and child will use raw pointer
+-    ContainerArgs* args_ptr = args.release();
+-
+     // Use fork() instead of clone() to avoid C++ stdlib issues
+     pid = fork();
+
+@@ -651,9 +647,13 @@
+
+     if (pid == 0) {
+         // Child process: setup namespaces then run container_main logic
++
++        // Release ownership in child process only
++        ContainerArgs* args_ptr = args.release();
+
+         // Join existing namespaces first
+         for (auto& ns_fd : args_ptr->join_namespaces) {
++            ns_fd.first |= O_CLOEXEC;  // Ensure FDs are closed on exec
+             if (setns(ns_fd.first, ns_fd.second) != 0) {
+                 perror("setns failed");
+                 _exit(1);
+@@ -707,7 +707,11 @@
+     }
+
+     // Parent process: continue setup
+-    // args_ptr is now managed by child process, parent should not free it
++    // args unique_ptr is still valid here and will be cleaned up automatically
++    // when this function returns. This is safe because fork() created a copy
++    // of the memory for the child process.
++
++    // Close file descriptors that were passed to child
++    for (auto& ns_fd : args->join_namespaces) {
++        close(ns_fd.first);
++    }
+
+     if (!configure_user_namespace(pid, creates_new_userns, uid_mappings, gid_mappings)) {

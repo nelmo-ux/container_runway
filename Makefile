@@ -1,7 +1,16 @@
 CXX = g++
-CXXFLAGS = -std=c++11 -Wall -O2
+CXXFLAGS = -std=c++11 -Wall -O2 -Iinclude -I.
 LDFLAGS =
-SRC = main.cpp
+RUNTIME_SRC = \
+      src/runtime/config.cpp \
+      src/runtime/options.cpp \
+      src/runtime/filesystem.cpp \
+      src/runtime/state.cpp \
+      src/runtime/process.cpp \
+      src/runtime/isolation.cpp \
+      src/runtime/console.cpp \
+      src/runtime/hooks.cpp
+SRC = main.cpp $(RUNTIME_SRC)
 TARGET = runtime
 PREFIX = /usr/local
 BIN_DIR = $(PREFIX)/bin
@@ -16,8 +25,8 @@ $(TARGET): $(SRC)
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRC) $(LDFLAGS)
 	@echo "Executable '$(TARGET)' has made."
 
-$(TEST_TARGET): $(TEST_DIR)/runtime_tests.cpp $(SRC)
-	$(CXX) $(CXXFLAGS) -o $(TEST_TARGET) $(TEST_DIR)/runtime_tests.cpp $(LDFLAGS)
+$(TEST_TARGET): $(TEST_DIR)/runtime_tests.cpp $(RUNTIME_SRC)
+	$(CXX) $(CXXFLAGS) -o $(TEST_TARGET) $(TEST_DIR)/runtime_tests.cpp $(RUNTIME_SRC) $(LDFLAGS)
 	@echo "Test binary '$(TEST_TARGET)' has made."
 
 test: $(TEST_TARGET)

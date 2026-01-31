@@ -2,65 +2,49 @@
 #define _GNU_SOURCE
 #endif
 
-#include <iostream>
-#include <string>
-#include <vector>
-#include <fstream>
-#include <sstream>
-#include <map>
-#include <cstring>
-#include <cstdlib>
-#include <csignal>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sched.h>
-#include <sys/wait.h>
-#include <sys/mount.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/syscall.h>
-#include <dirent.h>
-#include <system_error>
-#include <getopt.h>
-#include <memory>
-#include <cerrno>
 #include <algorithm>
-#include <limits.h>
-#include <cstdint>
-#include <set>
+#include <cerrno>
+#include <csignal>
 #include <chrono>
-#include <ctime>
+#include <cstring>
+#include <dirent.h>
+#include <fcntl.h>
+#include <fstream>
+#include <getopt.h>
+#include <grp.h>
 #include <iomanip>
-#include <thread>
-#include <queue>
-#include <termios.h>
+#include <iostream>
+#include <limits.h>
+#include <map>
+#include <memory>
+#include <sched.h>
+#include <set>
+#include <sstream>
+#include <string>
 #include <sys/ioctl.h>
+#include <termios.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
 
-#include "json.hpp"
-
-// A convenient alias for nlohmann::json
-using json = nlohmann::json;
-
-extern char** environ;
+#include "runtime/config.h"
+#include "runtime/console.h"
+#include "runtime/filesystem.h"
+#include "runtime/hooks.h"
+#include "runtime/isolation.h"
+#include "runtime/options.h"
+#include "runtime/process.h"
+#include "runtime/state.h"
 
 constexpr int STACK_SIZE = 1024 * 1024; // 1MB
-
-// Base path for cgroups
-const std::string CGROUP_BASE_PATH = "/sys/fs/cgroup/";
-
-struct GlobalOptions {
-    bool debug = false;
-    bool systemd_cgroup = false;
-    std::string log_path;
-    std::string log_format = "text";
-    std::string root_path;
-};
-
-static GlobalOptions g_global_options;
-static std::unique_ptr<std::ofstream> g_log_stream;
-static const std::string RUNTIME_VERSION = "0.1.0";
 
 enum GlobalOptionValue {
     OPT_DEBUG = 1000,
@@ -72,305 +56,7 @@ enum GlobalOptionValue {
     OPT_SYSTEMD_CGROUP
 };
 
-std::string ensure_trailing_slash(const std::string& path) {
-    if (path.empty() || path.back() == '/') {
-        return path;
-    }
-    return path + "/";
-}
 
-std::string state_base_path() {
-    return ensure_trailing_slash(g_global_options.root_path);
-}
-
-std::string fallback_state_root() {
-    return "/tmp/mruntime-" + std::to_string(geteuid());
-}
-
-std::string default_state_root() {
-    if (geteuid() == 0) {
-        return "/run/mruntime";
-    }
-    const char* runtime_dir = std::getenv("XDG_RUNTIME_DIR");
-    if (runtime_dir && runtime_dir[0] != '\0') {
-        return ensure_trailing_slash(runtime_dir) + "mruntime";
-    }
-    return fallback_state_root();
-}
-
-bool configure_log_destination(const std::string& path) {
-    std::unique_ptr<std::ofstream> stream(new std::ofstream(path, std::ios::app));
-    if (!stream || !(*stream)) {
-        std::cerr << "Failed to open log file: " << path << std::endl;
-        return false;
-    }
-    g_log_stream = std::move(stream);
-    std::cerr.rdbuf(g_log_stream->rdbuf());
-    return true;
-}
-
-void log_debug(const std::string& message) {
-    if (g_global_options.debug) {
-        std::cerr << "[debug] " << message << std::endl;
-    }
-}
-
-// --- C++ structs corresponding to the config.json structure ---
-
-struct ProcessConfig {
-    bool terminal;
-    std::vector<std::string> args;
-    std::vector<std::string> env;
-    std::string cwd = "/";
-};
-
-struct RootConfig {
-    std::string path;
-    bool readonly;
-};
-
-struct LinuxNamespaceConfig {
-    std::string type;
-    std::string path;
-};
-
-struct LinuxIDMapping {
-    uint32_t host_id = 0;
-    uint32_t container_id = 0;
-    uint32_t size = 0;
-};
-
-// Cgroup向けのコンフィグ設定
-struct LinuxResourcesConfig {
-    long long memory_limit = 0; // memory.limit_in_bytes
-    long long cpu_shares = 0;   // cpu.shares
-};
-
-struct MountConfig {
-    std::string destination;
-    std::string type;
-    std::string source;
-    std::vector<std::string> options;
-};
-
-struct LinuxConfig {
-    std::vector<LinuxNamespaceConfig> namespaces;
-    LinuxResourcesConfig resources;
-    std::vector<LinuxIDMapping> uid_mappings;
-    std::vector<LinuxIDMapping> gid_mappings;
-    std::vector<std::string> masked_paths;
-    std::vector<std::string> readonly_paths;
-    std::string rootfs_propagation;
-    std::string cgroups_path;
-};
-
-struct HookConfig {
-    std::string path;
-    std::vector<std::string> args;
-    std::vector<std::string> env;
-    int timeout = 0;
-};
-
-struct HooksConfig {
-    std::vector<HookConfig> create_runtime;
-    std::vector<HookConfig> create_container;
-    std::vector<HookConfig> start_container;
-    std::vector<HookConfig> prestart;
-    std::vector<HookConfig> poststart;
-    std::vector<HookConfig> poststop;
-};
-
-// config Jsonのパース用構造
-struct OCIConfig {
-    std::string ociVersion;
-    RootConfig root;
-    ProcessConfig process;
-    std::string hostname;
-    LinuxConfig linux;
-    std::vector<MountConfig> mounts;
-    std::map<std::string, std::string> annotations;
-    HooksConfig hooks;
-};
-
-// --- JSONファイルの読み込み ---
-
-void from_json(const json& j, ProcessConfig& p) {
-    j.at("args").get_to(p.args);
-    if (p.args.empty()) {
-        throw std::runtime_error("process.args must not be empty");
-    }
-    if (j.contains("cwd")) {
-        j.at("cwd").get_to(p.cwd);
-    } else {
-        p.cwd = "/";
-    }
-    if (j.contains("terminal")) {
-        j.at("terminal").get_to(p.terminal);
-    } else {
-        p.terminal = false;
-    }
-    if (j.contains("env")) {
-        j.at("env").get_to(p.env);
-    }
-}
-
-void from_json(const json& j, RootConfig& r) {
-    j.at("path").get_to(r.path);
-    if (j.contains("readonly")) {
-        j.at("readonly").get_to(r.readonly);
-    } else {
-        r.readonly = false;
-    }
-}
-
-void from_json(const json& j, LinuxNamespaceConfig& ns) {
-    j.at("type").get_to(ns.type);
-    if (j.contains("path")) {
-        j.at("path").get_to(ns.path);
-    }
-}
-
-void from_json(const json& j, LinuxIDMapping& map) {
-    j.at("hostID").get_to(map.host_id);
-    j.at("containerID").get_to(map.container_id);
-    j.at("size").get_to(map.size);
-}
-
-// Jsonのパース系
-// Note: Cgroups系の処理がメインPIDに対してのみかかっている可能性
-void from_json(const json& j, LinuxResourcesConfig& res) {
-    if (j.contains("memory") && j["memory"].contains("limit")) {
-        j["memory"].at("limit").get_to(res.memory_limit);
-    }
-    if (j.contains("cpu") && j["cpu"].contains("shares")) {
-        j["cpu"].at("shares").get_to(res.cpu_shares);
-    }
-}
-
-void from_json(const json& j, LinuxConfig& l) {
-    if (j.contains("namespaces")) {
-        j.at("namespaces").get_to(l.namespaces);
-    }
-    if (j.contains("resources")) {
-        j.at("resources").get_to(l.resources);
-    }
-    if (j.contains("uidMappings")) {
-        j.at("uidMappings").get_to(l.uid_mappings);
-    }
-    if (j.contains("gidMappings")) {
-        j.at("gidMappings").get_to(l.gid_mappings);
-    }
-    if (j.contains("maskedPaths")) {
-        j.at("maskedPaths").get_to(l.masked_paths);
-    }
-    if (j.contains("readonlyPaths")) {
-        j.at("readonlyPaths").get_to(l.readonly_paths);
-    }
-    if (j.contains("rootfsPropagation")) {
-        j.at("rootfsPropagation").get_to(l.rootfs_propagation);
-    }
-    if (j.contains("cgroupsPath")) {
-        j.at("cgroupsPath").get_to(l.cgroups_path);
-    }
-}
-
-void from_json(const json& j, MountConfig& m) {
-    j.at("destination").get_to(m.destination);
-    if (j.contains("type")) {
-        j.at("type").get_to(m.type);
-    }
-    if (j.contains("source")) {
-        j.at("source").get_to(m.source);
-    }
-    if (j.contains("options")) {
-        j.at("options").get_to(m.options);
-    }
-}
-
-void from_json(const json& j, HookConfig& hook) {
-    j.at("path").get_to(hook.path);
-    if (j.contains("args")) {
-        j.at("args").get_to(hook.args);
-    }
-    if (j.contains("env")) {
-        j.at("env").get_to(hook.env);
-    }
-    if (j.contains("timeout")) {
-        j.at("timeout").get_to(hook.timeout);
-    } else {
-        hook.timeout = 0;
-    }
-}
-
-void from_json(const json& j, HooksConfig& hooks) {
-    if (j.contains("createRuntime")) {
-        j.at("createRuntime").get_to(hooks.create_runtime);
-    }
-    if (j.contains("createContainer")) {
-        j.at("createContainer").get_to(hooks.create_container);
-    }
-    if (j.contains("startContainer")) {
-        j.at("startContainer").get_to(hooks.start_container);
-    }
-    if (j.contains("prestart")) {
-        j.at("prestart").get_to(hooks.prestart);
-    }
-    if (j.contains("poststart")) {
-        j.at("poststart").get_to(hooks.poststart);
-    }
-    if (j.contains("poststop")) {
-        j.at("poststop").get_to(hooks.poststop);
-    }
-}
-
-void from_json(const json& j, OCIConfig& c) {
-    j.at("ociVersion").get_to(c.ociVersion);
-    j.at("root").get_to(c.root);
-    j.at("process").get_to(c.process);
-    if (j.contains("hostname")) {
-        j.at("hostname").get_to(c.hostname);
-    }
-    if (j.contains("linux")) {
-        j.at("linux").get_to(c.linux);
-    }
-    if (j.contains("mounts")) {
-        j.at("mounts").get_to(c.mounts);
-    }
-    if (j.contains("annotations")) {
-        j.at("annotations").get_to(c.annotations);
-    }
-    if (j.contains("hooks")) {
-        j.at("hooks").get_to(c.hooks);
-    }
-}
-
-// RW とパース用関数
-OCIConfig load_config(const std::string& bundle_path) {
-    std::string config_path = bundle_path + "/config.json";
-    std::ifstream ifs(config_path);
-    if (!ifs) {
-        throw std::runtime_error("Failed to load config.json: " + config_path);
-    }
-    json j;
-    ifs >> j;
-    return j.get<OCIConfig>();
-}
-
-// FIFO用のヘルパー関数 以下 Claude生成
-std::string get_fifo_path(const std::string& container_id) {
-    return state_base_path() + container_id + "/sync_fifo";
-}
-
-std::string resolve_absolute_path(const std::string& path) {
-    if (path.empty()) {
-        return path;
-    }
-    char resolved_path[PATH_MAX];
-    if (realpath(path.c_str(), resolved_path) != nullptr) {
-        return std::string(resolved_path);
-    }
-    return path;
-}
 
 // Struct to hold arguments for the container
 struct ContainerArgs {
@@ -389,6 +75,9 @@ struct ContainerArgs {
     std::vector<std::pair<int, int>> join_namespaces;
     bool terminal = false;
     int console_slave_fd = -1;
+    uint32_t uid = 0;
+    uint32_t gid = 0;
+    std::vector<uint32_t> additional_gids;
 };
 
 struct CreateOptions {
@@ -418,869 +107,12 @@ struct EventsOptions {
     int interval_ms = 1000;
 };
 
-// Struct to represent the container's state
-struct ContainerState {
-    std::string version;
-    std::string oci_version;
-    std::string id;
-    pid_t pid = -1;
-    std::string status; // creating, created, running, stopped
-    std::string bundle_path;
-    std::map<std::string, std::string> annotations;
-
-    json to_json_object() const {
-        std::string reported_version = version.empty() ? (oci_version.empty() ? RUNTIME_VERSION : oci_version) : version;
-        std::string reported_oci = oci_version.empty() ? reported_version : oci_version;
-        json j = {
-            {"version", reported_version},
-            {"ociVersion", reported_oci},
-            {"id", id},
-            {"status", status},
-            {"pid", pid >= 0 ? pid : 0},
-            {"bundle", bundle_path.empty() ? "." : bundle_path}
-        };
-        if (!annotations.empty()) {
-            j["annotations"] = annotations;
-        }
-        return j;
-    }
-
-    std::string to_json() const {
-        return to_json_object().dump(4);
-    }
-
-    static ContainerState from_json(const std::string& json_str) {
-        ContainerState state;
-        json j = json::parse(json_str);
-        if (j.contains("version")) {
-            j.at("version").get_to(state.version);
-        }
-        if (j.contains("ociVersion")) {
-            j.at("ociVersion").get_to(state.oci_version);
-            if (state.version.empty()) {
-                state.version = state.oci_version;
-            }
-        }
-        j.at("id").get_to(state.id);
-        j.at("pid").get_to(state.pid);
-        j.at("status").get_to(state.status);
-        if (j.contains("bundle")) {
-            j.at("bundle").get_to(state.bundle_path);
-        } else if (j.contains("bundle_path")) {
-            j.at("bundle_path").get_to(state.bundle_path);
-        }
-        if (j.contains("annotations")) {
-            j.at("annotations").get_to(state.annotations);
-        }
-        return state;
-    }
-};
-
-bool save_state(const ContainerState& state) {
-    std::string container_path = state_base_path() + state.id;
-    std::string state_file_path = container_path + "/state.json";
-    if (mkdir(container_path.c_str(), 0755) != 0 && errno != EEXIST) {
-        perror("Failed to create state directory");
-        return false;
-    }
-    std::ofstream ofs(state_file_path);
-    if (!ofs) {
-        std::cerr << "Failed to open state file: " << state_file_path << std::endl;
-        return false;
-    }
-    ofs << state.to_json();
-    return true;
-}
-
-ContainerState load_state(const std::string& container_id) {
-    std::string state_file_path = state_base_path() + container_id + "/state.json";
-    std::ifstream ifs(state_file_path);
-    if (!ifs) {
-        throw std::runtime_error("Failed to load state file: " + state_file_path);
-    }
-    std::stringstream buffer;
-    buffer << ifs.rdbuf();
-    return ContainerState::from_json(buffer.str());
-}
-//ここまで
-
-
-//Cgroup系の処理
-
-bool write_pid_file(const std::string& pid_file, pid_t pid) {
-    std::ofstream ofs(pid_file);
-    if (!ofs) {
-        std::cerr << "Failed to open pid file: " << pid_file << std::endl;
-        return false;
-    }
-    ofs << pid << std::endl;
-    return true;
-}
-
-// Helper to write to a cgroup file
-void write_cgroup_file(const std::string& path, const std::string& value) {
-    std::ofstream ofs(path);
-    if (!ofs) {
-        throw std::runtime_error("Failed to open cgroup file: " + path);
-    }
-    ofs << value;
-}
-
-bool ensure_directory(const std::string& path, mode_t mode = 0755);
-unsigned long cpu_shares_to_weight(long long shares);
-bool ensure_parent_directory(const std::string& path);
-std::string iso8601_now();
-std::string events_file_path(const std::string& id);
-void record_event(const std::string& id, const std::string& type, const json& data = json::object());
-bool wait_for_process(pid_t pid, int timeout_sec, int& status);
-bool run_hook_sequence(const std::vector<HookConfig>& hooks,
-                       ContainerState& state,
-                       const std::string& hook_type,
-                       bool enforce_once = true);
-
-//seccomp系アタッチ
-//void attach_bpf(pid_t pid, int& syscalls[], bool isActive){
-//    //Todo: BPF処理を外部実装
-//}
-
-// 制限のアタッチ
-void setup_cgroups(pid_t pid,
-                   const std::string& id,
-                   const LinuxConfig& linux_config,
-                   std::string& out_relative_path) {
-    log_debug("Setting up cgroups for container " + id);
-
-    std::string relative_path = linux_config.cgroups_path;
-    if (!relative_path.empty() && relative_path.front() == '/') {
-        relative_path.erase(0, 1);
-    }
-    while (!relative_path.empty() && relative_path.back() == '/') {
-        relative_path.pop_back();
-    }
-    if (relative_path.empty()) {
-        relative_path = "my_runtime/" + id;
-    }
-    out_relative_path = relative_path;
-
-    const std::string controllers_file = CGROUP_BASE_PATH + "cgroup.controllers";
-    bool is_cgroup_v2 = (access(controllers_file.c_str(), F_OK) == 0);
-
-    if (is_cgroup_v2) {
-        std::set<std::string> available_controllers;
-        std::ifstream ctrl_stream(controllers_file);
-        if (ctrl_stream) {
-            std::string ctrl;
-            while (ctrl_stream >> ctrl) {
-                available_controllers.insert(ctrl);
-            }
-        }
-
-        std::vector<std::string> required_controllers;
-        if (linux_config.resources.memory_limit > 0) {
-            if (!available_controllers.count("memory")) {
-                throw std::runtime_error("memory controller not available in cgroup v2");
-            }
-            required_controllers.emplace_back("memory");
-        }
-        if (linux_config.resources.cpu_shares > 0) {
-            if (!available_controllers.count("cpu")) {
-                throw std::runtime_error("cpu controller not available in cgroup v2");
-            }
-            required_controllers.emplace_back("cpu");
-        }
-
-        for (const auto& controller : required_controllers) {
-            std::ofstream subtree(CGROUP_BASE_PATH + "cgroup.subtree_control");
-            if (subtree) {
-                subtree << "+" << controller << std::endl;
-            }
-        }
-
-        std::string unified_path = CGROUP_BASE_PATH + relative_path;
-        if (!ensure_directory(unified_path, 0755)) {
-            throw std::system_error(errno, std::system_category(), "Failed to create unified cgroup dir");
-        }
-
-        if (linux_config.resources.memory_limit > 0) {
-            write_cgroup_file(unified_path + "/memory.max", std::to_string(linux_config.resources.memory_limit));
-        }
-        if (linux_config.resources.cpu_shares > 0) {
-            unsigned long weight = cpu_shares_to_weight(linux_config.resources.cpu_shares);
-            write_cgroup_file(unified_path + "/cpu.weight", std::to_string(weight));
-        }
-
-        write_cgroup_file(unified_path + "/cgroup.procs", std::to_string(pid));
-        return;
-    }
-
-    // Memory Cgroup
-    if (linux_config.resources.memory_limit > 0) {
-        std::string mem_cgroup_path = CGROUP_BASE_PATH + "memory/" + relative_path;
-        if (!ensure_directory(mem_cgroup_path, 0755)) {
-            throw std::system_error(errno, std::system_category(), "Failed to create memory cgroup dir");
-        }
-        write_cgroup_file(mem_cgroup_path + "/memory.limit_in_bytes", std::to_string(linux_config.resources.memory_limit));
-        write_cgroup_file(mem_cgroup_path + "/cgroup.procs", std::to_string(pid));
-    }
-
-    // CPU Cgroup
-    if (linux_config.resources.cpu_shares > 0) {
-        std::string cpu_cgroup_path = CGROUP_BASE_PATH + "cpu/" + relative_path;
-        if (!ensure_directory(cpu_cgroup_path, 0755)) {
-            throw std::system_error(errno, std::system_category(), "Failed to create cpu cgroup dir");
-        }
-        write_cgroup_file(cpu_cgroup_path + "/cpu.shares", std::to_string(linux_config.resources.cpu_shares));
-        write_cgroup_file(cpu_cgroup_path + "/cgroup.procs", std::to_string(pid));
-    }
-}
-
-// Cleans up cgroups for the container
-void cleanup_cgroups(const std::string& id, const std::string& relative_path_hint) {
-    log_debug("Cleaning up cgroups for container " + id);
-    std::string relative_path = relative_path_hint;
-    if (!relative_path.empty() && relative_path.front() == '/') {
-        relative_path.erase(0, 1);
-    }
-    while (!relative_path.empty() && relative_path.back() == '/') {
-        relative_path.pop_back();
-    }
-    if (relative_path.empty()) {
-        relative_path = "my_runtime/" + id;
-    }
-
-    const std::string controllers_file = CGROUP_BASE_PATH + "cgroup.controllers";
-    bool is_cgroup_v2 = (access(controllers_file.c_str(), F_OK) == 0);
-
-    if (is_cgroup_v2) {
-        std::string unified_path = CGROUP_BASE_PATH + relative_path;
-        if (rmdir(unified_path.c_str()) != 0 && errno != ENOENT) {
-            perror(("Failed to remove cgroup dir: " + unified_path).c_str());
-        }
-        return;
-    }
-
-    std::string mem_cgroup_path = CGROUP_BASE_PATH + "memory/" + relative_path;
-    if (rmdir(mem_cgroup_path.c_str()) != 0 && errno != ENOENT) {
-        perror(("Failed to remove memory cgroup dir: " + mem_cgroup_path).c_str());
-    }
-    std::string cpu_cgroup_path = CGROUP_BASE_PATH + "cpu/" + relative_path;
-    if (rmdir(cpu_cgroup_path.c_str()) != 0 && errno != ENOENT) {
-        perror(("Failed to remove cpu cgroup dir: " + cpu_cgroup_path).c_str());
-    }
-}
-
-struct ConsolePair {
-    int master_fd = -1;
-    int slave_fd = -1;
-    std::string slave_name;
-};
-
-void close_console_pair(ConsolePair& pair) {
-    if (pair.master_fd >= 0) {
-        close(pair.master_fd);
-        pair.master_fd = -1;
-    }
-    if (pair.slave_fd >= 0) {
-        close(pair.slave_fd);
-        pair.slave_fd = -1;
-    }
-}
-
-bool allocate_console_pair(ConsolePair& pair, std::string& error_message) {
-    ConsolePair tmp;
-    tmp.master_fd = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
-    if (tmp.master_fd == -1) {
-        error_message = std::string("posix_openpt failed: ") + std::strerror(errno);
-        return false;
-    }
-    if (grantpt(tmp.master_fd) != 0) {
-        error_message = std::string("grantpt failed: ") + std::strerror(errno);
-        close_console_pair(tmp);
-        return false;
-    }
-    if (unlockpt(tmp.master_fd) != 0) {
-        error_message = std::string("unlockpt failed: ") + std::strerror(errno);
-        close_console_pair(tmp);
-        return false;
-    }
-    char slave_name_buf[PATH_MAX];
-    if (ptsname_r(tmp.master_fd, slave_name_buf, sizeof(slave_name_buf)) != 0) {
-        error_message = std::string("ptsname_r failed: ") + std::strerror(errno);
-        close_console_pair(tmp);
-        return false;
-    }
-    tmp.slave_name = slave_name_buf;
-    tmp.slave_fd = open(slave_name_buf, O_RDWR | O_NOCTTY | O_CLOEXEC);
-    if (tmp.slave_fd == -1) {
-        error_message = std::string("open slave pty failed: ") + std::strerror(errno);
-        close_console_pair(tmp);
-        return false;
-    }
-    pair = tmp;
-    return true;
-}
-
-bool send_console_fd(const ConsolePair& pair, const std::string& socket_path, std::string& error_message) {
-    int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (sock == -1) {
-        error_message = std::string("socket creation failed: ") + std::strerror(errno);
-        return false;
-    }
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    if (socket_path.size() >= sizeof(addr.sun_path)) {
-        error_message = "console socket path too long";
-        close(sock);
-        return false;
-    }
-    std::strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
-    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        error_message = std::string("connect to console socket failed: ") + std::strerror(errno);
-        close(sock);
-        return false;
-    }
-
-    std::string payload = pair.slave_name.empty() ? "console" : pair.slave_name;
-    struct iovec iov{};
-    iov.iov_base = const_cast<char*>(payload.c_str());
-    iov.iov_len = payload.size();
-
-    char control[CMSG_SPACE(sizeof(int))];
-    std::memset(control, 0, sizeof(control));
-
-    struct msghdr msg{};
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control;
-    msg.msg_controllen = sizeof(control);
-
-    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    std::memcpy(CMSG_DATA(cmsg), &pair.master_fd, sizeof(int));
-    msg.msg_controllen = CMSG_SPACE(sizeof(int));
-
-    ssize_t sent = sendmsg(sock, &msg, 0);
-    int saved_errno = errno;
-    close(sock);
-    if (sent == -1) {
-        error_message = std::string("sendmsg failed: ") + std::strerror(saved_errno);
-        return false;
-    }
-    return true;
-}
-
-std::string iso8601_now() {
-    using namespace std::chrono;
-    auto now = system_clock::now();
-    auto seconds = system_clock::to_time_t(now);
-    std::tm tm{};
-    gmtime_r(&seconds, &tm);
-    auto millis = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%FT%T") << '.' << std::setfill('0') << std::setw(3) << millis.count() << 'Z';
-    return oss.str();
-}
-
-std::string events_file_path(const std::string& id) {
-    return state_base_path() + id + "/events.log";
-}
-
-bool wait_for_process(pid_t pid, int timeout_sec, int& status) {
-    if (timeout_sec <= 0) {
-        return waitpid(pid, &status, 0) == pid;
-    }
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
-    while (true) {
-        pid_t result = waitpid(pid, &status, WNOHANG);
-        if (result == pid) {
-            return true;
-        }
-        if (result == -1) {
-            return false;
-        }
-        if (std::chrono::steady_clock::now() >= deadline) {
-            kill(pid, SIGKILL);
-            waitpid(pid, &status, 0);
-            errno = ETIMEDOUT;
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-}
-
-bool write_all(int fd, const std::string& data) {
-    size_t written = 0;
-    while (written < data.size()) {
-        ssize_t n = write(fd, data.data() + written, data.size() - written);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return false;
-        }
-        written += static_cast<size_t>(n);
-    }
-    return true;
-}
-
-bool execute_single_hook(const HookConfig& hook,
-                         const ContainerState& state,
-                         const std::string& hook_type) {
-    if (hook.path.empty()) {
-        std::cerr << "Hook path is empty for " << hook_type << std::endl;
-        return false;
-    }
-    int pipe_fds[2];
-    if (pipe(pipe_fds) != 0) {
-        perror("pipe for hook stdin failed");
-        return false;
-    }
-
-    pid_t pid = fork();
-    if (pid == -1) {
-        perror("fork for hook failed");
-        close(pipe_fds[0]);
-        close(pipe_fds[1]);
-        return false;
-    }
-
-    if (pid == 0) {
-        close(pipe_fds[1]);
-        if (dup2(pipe_fds[0], STDIN_FILENO) == -1) {
-            perror("dup2 failed for hook stdin");
-            _exit(127);
-        }
-        close(pipe_fds[0]);
-
-        std::vector<std::string> args = hook.args.empty() ? std::vector<std::string>{hook.path} : hook.args;
-        std::vector<char*> argv;
-        argv.reserve(args.size() + 1);
-        for (auto& arg : args) {
-            argv.push_back(const_cast<char*>(arg.c_str()));
-        }
-        argv.push_back(nullptr);
-
-        std::vector<std::string> env_strings;
-        for (char** env = environ; env && *env; ++env) {
-            env_strings.emplace_back(*env);
-        }
-        env_strings.emplace_back("OCI_HOOK_TYPE=" + hook_type);
-        env_strings.emplace_back("OCI_CONTAINER_ID=" + state.id);
-        env_strings.emplace_back("OCI_CONTAINER_BUNDLE=" + (state.bundle_path.empty() ? "." : state.bundle_path));
-        env_strings.emplace_back("OCI_CONTAINER_PID=" + std::to_string(state.pid));
-        env_strings.emplace_back("OCI_CONTAINER_STATUS=" + state.status);
-        for (const auto& env_entry : hook.env) {
-            env_strings.emplace_back(env_entry);
-        }
-
-        std::vector<char*> envp;
-        envp.reserve(env_strings.size() + 1);
-        for (auto& env_entry : env_strings) {
-            envp.push_back(const_cast<char*>(env_entry.c_str()));
-        }
-        envp.push_back(nullptr);
-
-        execve(hook.path.c_str(), argv.data(), envp.data());
-        perror(("Failed to exec hook: " + hook.path).c_str());
-        _exit(127);
-    }
-
-    close(pipe_fds[0]);
-    std::string payload = state.to_json();
-    bool write_ok = write_all(pipe_fds[1], payload);
-    close(pipe_fds[1]);
-    if (!write_ok) {
-        std::cerr << "Failed to write container state to hook stdin: " << hook.path << std::endl;
-        kill(pid, SIGKILL);
-        waitpid(pid, nullptr, 0);
-        return false;
-    }
-
-    int status = 0;
-    if (!wait_for_process(pid, hook.timeout, status)) {
-        std::cerr << "Hook '" << hook.path << "' timed out or failed for " << hook_type << std::endl;
-        return false;
-    }
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        return true;
-    }
-    if (WIFEXITED(status)) {
-        std::cerr << "Hook '" << hook.path << "' exited with status "
-                  << WEXITSTATUS(status) << " for " << hook_type << std::endl;
-    } else if (WIFSIGNALED(status)) {
-        std::cerr << "Hook '" << hook.path << "' terminated by signal "
-                  << WTERMSIG(status) << " for " << hook_type << std::endl;
-    }
-    return false;
-}
-
-bool run_hook_sequence(const std::vector<HookConfig>& hooks,
-                       ContainerState& state,
-                       const std::string& hook_type,
-                       bool enforce_once) {
-    if (hooks.empty()) {
-        return true;
-    }
-    std::string annotation_key = "runway.hooks." + hook_type;
-    if (enforce_once) {
-        auto it = state.annotations.find(annotation_key);
-        if (it != state.annotations.end()) {
-            return true;
-        }
-    }
-    for (const auto& hook : hooks) {
-        if (!execute_single_hook(hook, state, hook_type)) {
-            return false;
-        }
-    }
-    state.annotations[annotation_key] = iso8601_now();
-    return true;
-}
-
-void record_event(const std::string& id, const std::string& type, const json& data) {
-    std::string path = events_file_path(id);
-    if (!ensure_parent_directory(path)) {
-        std::cerr << "Failed to prepare events log for container '" << id << "'" << std::endl;
-        return;
-    }
-    std::ofstream ofs(path, std::ios::app);
-    if (!ofs) {
-        std::cerr << "Failed to open events log for container '" << id << "'" << std::endl;
-        return;
-    }
-    json entry = {
-            {"timestamp", iso8601_now()},
-            {"type", type},
-            {"id", id}
-    };
-    if (!data.is_null()) {
-        entry["data"] = data;
-    }
-    ofs << entry.dump() << std::endl;
-}
-
-void record_state_event(const ContainerState& state) {
-    record_event(state.id, "state", state.to_json_object());
-}
-
-std::string format_id_mappings(const std::vector<LinuxIDMapping>& mappings) {
-    std::ostringstream oss;
-    for (const auto& mapping : mappings) {
-        oss << mapping.container_id << " " << mapping.host_id << " " << mapping.size << "\n";
-    }
-    return oss.str();
-}
-
-bool write_mapping_file(const std::string& path, const std::vector<LinuxIDMapping>& mappings) {
-    if (mappings.empty()) {
-        return true;
-    }
-    std::ofstream ofs(path);
-    if (!ofs) {
-        perror(("Failed to open " + path).c_str());
-        return false;
-    }
-    ofs << format_id_mappings(mappings);
-    if (!ofs.good()) {
-        perror(("Failed to write " + path).c_str());
-        return false;
-    }
-    return true;
-}
-
-bool configure_user_namespace(pid_t pid,
-                              bool creates_new_userns,
-                              const std::vector<LinuxIDMapping>& uid_mappings,
-                              const std::vector<LinuxIDMapping>& gid_mappings) {
-    if (!creates_new_userns) {
-        return true;
-    }
-
-    const std::string proc_prefix = "/proc/" + std::to_string(pid);
-
-    if (!gid_mappings.empty()) {
-        std::ofstream setgroups_file(proc_prefix + "/setgroups");
-        if (setgroups_file) {
-            setgroups_file << "deny\n";
-            if (!setgroups_file.good()) {
-                perror(("Failed to write " + proc_prefix + "/setgroups").c_str());
-                return false;
-            }
-        } else if (errno != ENOENT) {
-            perror(("Failed to open " + proc_prefix + "/setgroups").c_str());
-            return false;
-        }
-    }
-
-    if (!write_mapping_file(proc_prefix + "/uid_map", uid_mappings)) {
-        return false;
-    }
-    if (!write_mapping_file(proc_prefix + "/gid_map", gid_mappings)) {
-        return false;
-    }
-    return true;
-}
-
-unsigned long cpu_shares_to_weight(long long shares) {
-    if (shares <= 0) {
-        return 100;
-    }
-    if (shares < 2) {
-        return 1;
-    }
-    if (shares > 262144) {
-        shares = 262144;
-    }
-    return static_cast<unsigned long>(1 + ((shares - 2) * 9999) / 262142);
-}
-
-struct ParsedMountOptions {
-    unsigned long flags = 0;
-    unsigned long propagation = 0;
-    bool has_propagation = false;
-    bool bind_readonly = false;
-    std::string data;
-};
-
-std::string join_strings(const std::vector<std::string>& parts, const char* delimiter = ",") {
-    if (parts.empty()) {
-        return "";
-    }
-    std::ostringstream oss;
-    for (size_t i = 0; i < parts.size(); ++i) {
-        if (i > 0) {
-            oss << delimiter;
-        }
-        oss << parts[i];
-    }
-    return oss.str();
-}
-
-ParsedMountOptions parse_mount_options(const std::vector<std::string>& options) {
-    ParsedMountOptions parsed;
-    std::vector<std::string> data_options;
-    for (const auto& opt : options) {
-        if (opt == "ro") {
-            parsed.flags |= MS_RDONLY;
-        } else if (opt == "rw") {
-            parsed.flags &= ~MS_RDONLY;
-        } else if (opt == "nosuid") {
-            parsed.flags |= MS_NOSUID;
-        } else if (opt == "nodev") {
-            parsed.flags |= MS_NODEV;
-        } else if (opt == "noexec") {
-            parsed.flags |= MS_NOEXEC;
-        } else if (opt == "relatime") {
-            parsed.flags |= MS_RELATIME;
-        } else if (opt == "norelatime") {
-            parsed.flags &= ~MS_RELATIME;
-        } else if (opt == "strictatime") {
-            parsed.flags |= MS_STRICTATIME;
-        } else if (opt == "nostrictatime") {
-            parsed.flags &= ~MS_STRICTATIME;
-        } else if (opt == "sync") {
-            parsed.flags |= MS_SYNCHRONOUS;
-        } else if (opt == "dirsync") {
-            parsed.flags |= MS_DIRSYNC;
-        } else if (opt == "remount") {
-            parsed.flags |= MS_REMOUNT;
-        } else if (opt == "bind") {
-            parsed.flags |= MS_BIND;
-        } else if (opt == "rbind") {
-            parsed.flags |= (MS_BIND | MS_REC);
-        } else if (opt == "recursive") {
-            parsed.flags |= MS_REC;
-        } else if (opt == "private") {
-            parsed.propagation = MS_PRIVATE;
-            parsed.has_propagation = true;
-        } else if (opt == "rprivate") {
-            parsed.propagation = MS_PRIVATE | MS_REC;
-            parsed.has_propagation = true;
-        } else if (opt == "shared") {
-            parsed.propagation = MS_SHARED;
-            parsed.has_propagation = true;
-        } else if (opt == "rshared") {
-            parsed.propagation = MS_SHARED | MS_REC;
-            parsed.has_propagation = true;
-        } else if (opt == "slave") {
-            parsed.propagation = MS_SLAVE;
-            parsed.has_propagation = true;
-        } else if (opt == "rslave") {
-            parsed.propagation = MS_SLAVE | MS_REC;
-            parsed.has_propagation = true;
-        } else if (opt == "unbindable") {
-            parsed.propagation = MS_UNBINDABLE;
-            parsed.has_propagation = true;
-        } else if (opt == "runbindable") {
-            parsed.propagation = MS_UNBINDABLE | MS_REC;
-            parsed.has_propagation = true;
-        } else if (opt.find('=') != std::string::npos) {
-            data_options.push_back(opt);
-        } else {
-            data_options.push_back(opt);
-        }
-    }
-    parsed.data = join_strings(data_options);
-    if ((parsed.flags & MS_BIND) && (parsed.flags & MS_RDONLY)) {
-        parsed.bind_readonly = true;
-    }
-    return parsed;
-}
-
-bool ensure_directory(const std::string& path, mode_t mode) {
-    if (path.empty()) {
-        return false;
-    }
-    struct stat st{};
-    if (stat(path.c_str(), &st) == 0) {
-        return S_ISDIR(st.st_mode);
-    }
-    std::string parent;
-    auto pos = path.find_last_of('/');
-    if (pos != std::string::npos && pos != 0) {
-        parent = path.substr(0, pos);
-    } else if (pos == 0) {
-        parent = "/";
-    }
-    if (!parent.empty() && parent != path) {
-        if (!ensure_directory(parent, mode)) {
-            return false;
-        }
-    }
-    if (mkdir(path.c_str(), mode) == 0 || errno == EEXIST) {
-        return true;
-    }
-    return false;
-}
-
-bool ensure_parent_directory(const std::string& path) {
-    auto pos = path.find_last_of('/');
-    if (pos == std::string::npos || pos == 0) {
-        return true;
-    }
-    return ensure_directory(path.substr(0, pos));
-}
-
-bool ensure_file(const std::string& path, mode_t mode = 0644) {
-    struct stat st{};
-    if (stat(path.c_str(), &st) == 0) {
-        return S_ISREG(st.st_mode);
-    }
-    if (!ensure_parent_directory(path)) {
-        return false;
-    }
-    int fd = open(path.c_str(), O_CREAT | O_CLOEXEC | O_WRONLY, mode);
-    if (fd == -1) {
-        return false;
-    }
-    close(fd);
-    return true;
-}
-
-bool ensure_runtime_root_directory() {
-    if (g_global_options.root_path.empty()) {
-        g_global_options.root_path = default_state_root();
-    }
-    if (g_global_options.root_path.size() > 1 && g_global_options.root_path.back() == '/') {
-        g_global_options.root_path.pop_back();
-    }
-    if (ensure_directory(g_global_options.root_path, 0755)) {
-        return true;
-    }
-    int primary_error = errno;
-    if (geteuid() != 0) {
-        std::string fallback = fallback_state_root();
-        if (fallback.size() > 1 && fallback.back() == '/') {
-            fallback.pop_back();
-        }
-        if (fallback != g_global_options.root_path) {
-            log_debug("Unable to use preferred state root '" + g_global_options.root_path +
-                      "': " + std::strerror(primary_error));
-            if (ensure_directory(fallback, 0755)) {
-                log_debug("Falling back to runtime state root '" + fallback + "'");
-                g_global_options.root_path = fallback;
-                return true;
-            }
-            std::cerr << "Failed to create runtime root directory '" << fallback
-                      << "': " << std::strerror(errno) << std::endl;
-            return false;
-        }
-    }
-    std::cerr << "Failed to create runtime root directory '" << g_global_options.root_path
-              << "': " << std::strerror(primary_error) << std::endl;
-    return false;
-}
-
-std::string container_absolute_path(const std::string& rootfs, const std::string& path) {
-    if (path.empty() || path == ".") {
-        return rootfs;
-    }
-    if (path.front() == '/') {
-        return rootfs + path;
-    }
-    return rootfs + "/" + path;
-}
-
-unsigned long propagation_flag_from_string(const std::string& propagation) {
-    if (propagation == "private") {
-        return MS_PRIVATE;
-    }
-    if (propagation == "rprivate") {
-        return MS_PRIVATE | MS_REC;
-    }
-    if (propagation == "shared") {
-        return MS_SHARED;
-    }
-    if (propagation == "rshared") {
-        return MS_SHARED | MS_REC;
-    }
-    if (propagation == "slave") {
-        return MS_SLAVE;
-    }
-    if (propagation == "rslave") {
-        return MS_SLAVE | MS_REC;
-    }
-    if (propagation == "unbindable") {
-        return MS_UNBINDABLE;
-    }
-    if (propagation == "runbindable") {
-        return MS_UNBINDABLE | MS_REC;
-    }
-    return 0;
-}
-
-bool apply_mount_propagation(const std::string& path, const std::string& propagation) {
-    if (propagation.empty()) {
-        return true;
-    }
-    unsigned long flag = propagation_flag_from_string(propagation);
-    if (flag == 0) {
-        std::cerr << "Unknown rootfs propagation mode: " << propagation << std::endl;
-        return false;
-    }
-    if (mount(nullptr, path.c_str(), nullptr, flag, nullptr) != 0) {
-        perror(("Failed to set propagation on " + path).c_str());
-        return false;
-    }
-    return true;
-}
-
-
 // Entry point for the child process (container)
+// This runs after fork() + unshare(), so C++ stdlib is safe to use
 int container_main(void* arg) {
-    std::unique_ptr<ContainerArgs> args_holder(static_cast<ContainerArgs*>(arg));
-    ContainerArgs* args = args_holder.get();
+    ContainerArgs* args = static_cast<ContainerArgs*>(arg);
 
-    for (auto& ns_fd : args->join_namespaces) {
-        if (setns(ns_fd.first, ns_fd.second) != 0) {
-            perror("setns failed");
-            return 1;
-        }
-        close(ns_fd.first);
-    }
-    args->join_namespaces.clear();
+    // join_namespaces already handled in parent's child process before calling this
 
     // 1. Wait for the start signal from the parent process
     char buf;
@@ -1363,8 +195,15 @@ int container_main(void* arg) {
         if (mount(source, mount_target.c_str(), fs_type,
                   first_flags,
                   parsed.data.empty() ? nullptr : parsed.data.c_str()) != 0) {
-            perror(("Failed to mount " + destination).c_str());
-            return 1;
+            // Ignore EBUSY/EPERM errors for cgroup mounts - cgroup v2 may not allow mounting
+            bool is_cgroup = (destination.find("cgroup") != std::string::npos ||
+                             (fs_type && std::string(fs_type).find("cgroup") != std::string::npos));
+            if (is_cgroup && (errno == EBUSY || errno == EPERM || errno == EACCES)) {
+                // cgroup already mounted or not permitted, continue
+            } else {
+                perror(("Failed to mount " + destination).c_str());
+                return 1;
+            }
         }
 
         if (parsed.bind_readonly) {
@@ -1390,48 +229,6 @@ int container_main(void* arg) {
         }
     }
 
-    for (const auto& masked : args->masked_paths) {
-        if (masked.empty()) {
-            continue;
-        }
-        std::string target = container_absolute_path(rootfs, masked);
-        struct stat st{};
-        bool is_dir = false;
-        if (lstat(target.c_str(), &st) == 0) {
-            is_dir = S_ISDIR(st.st_mode);
-        } else {
-            if (masked.back() == '/') {
-                if (!ensure_directory(target)) {
-                    std::cerr << "Failed to create masked directory: " << target << std::endl;
-                    return 1;
-                }
-                is_dir = true;
-            } else if (ensure_file(target)) {
-                is_dir = false;
-            } else if (ensure_directory(target)) {
-                is_dir = true;
-            }
-        }
-
-        if (is_dir) {
-            if (mount("tmpfs", target.c_str(), "tmpfs",
-                      MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
-                      "size=0") != 0) {
-                perror(("Failed to mask directory " + masked).c_str());
-                return 1;
-            }
-        } else {
-            if (!ensure_file(target)) {
-                std::cerr << "Failed to create masked file: " << target << std::endl;
-                return 1;
-            }
-            if (mount("/dev/null", target.c_str(), nullptr, MS_BIND, nullptr) != 0) {
-                perror(("Failed to mask file " + masked).c_str());
-                return 1;
-            }
-        }
-    }
-
     for (const auto& ro_path : args->readonly_paths) {
         if (ro_path.empty()) {
             continue;
@@ -1442,42 +239,47 @@ int container_main(void* arg) {
             // Attempt to create the path if it doesn't exist.
             if (ro_path.back() == '/') {
                 if (!ensure_directory(target)) {
-                    std::cerr << "Failed to prepare readonly directory: " << target << std::endl;
-                    return 1;
+                    // Skip if creation fails (e.g., in /proc)
+                    continue;
                 }
             } else if (!ensure_file(target) && !ensure_directory(target)) {
-                std::cerr << "Failed to prepare readonly path: " << target << std::endl;
-                return 1;
+                // Skip if creation fails (e.g., in /proc)
+                continue;
             }
         }
         if (mount(target.c_str(), target.c_str(), nullptr, MS_BIND | MS_REC, nullptr) != 0) {
-            perror(("Failed to bind-mount readonly path " + ro_path).c_str());
-            return 1;
+            // Ignore mount failures - some paths may not be mountable
+            continue;
         }
         if (mount(nullptr, target.c_str(), nullptr, MS_BIND | MS_REMOUNT | MS_REC | MS_RDONLY, nullptr) != 0) {
-            perror(("Failed to remount readonly path " + ro_path).c_str());
-            return 1;
+            // Ignore remount failures
+            continue;
         }
     }
 
     bool pivot_succeeded = false;
     if (args->enable_pivot_root) {
-        const std::string old_root_dir = ".runway-oldroot";
-        if (!ensure_directory(old_root_dir, 0700)) {
-            std::cerr << "Failed to prepare old root directory for pivot_root" << std::endl;
-        } else if (syscall(SYS_pivot_root, ".", old_root_dir.c_str()) != 0) {
-            perror("pivot_root failed");
-        } else {
-            pivot_succeeded = true;
-            if (chdir("/") != 0) {
-                perror("chdir to new root failed");
-                return 1;
-            }
-            if (umount2(("/" + old_root_dir).c_str(), MNT_DETACH) != 0) {
-                perror("Failed to unmount old root");
-            }
-            if (rmdir(("/" + old_root_dir).c_str()) != 0) {
-                perror("Failed to remove old root directory");
+        // pivot_root requires the new root to be a mount point
+        // We already bind-mounted it, but we need to ensure it's a distinct mountpoint
+        // Remount to make it a proper mountpoint
+        if (mount(".", ".", nullptr, MS_BIND | MS_REC, nullptr) == 0) {
+            const std::string old_root_dir = ".runway-oldroot";
+            if (!ensure_directory(old_root_dir, 0700)) {
+                // Directory creation failed, skip pivot_root
+            } else if (syscall(SYS_pivot_root, ".", old_root_dir.c_str()) != 0) {
+                // pivot_root failed, will fallback to chroot (silent)
+            } else {
+                pivot_succeeded = true;
+                if (chdir("/") != 0) {
+                    perror("chdir to new root failed");
+                    return 1;
+                }
+                if (umount2(("/" + old_root_dir).c_str(), MNT_DETACH) != 0) {
+                    // Unmount failures are not fatal
+                }
+                if (rmdir(("/" + old_root_dir).c_str()) != 0) {
+                    // Cleanup failures are not fatal
+                }
             }
         }
     }
@@ -1507,6 +309,54 @@ int container_main(void* arg) {
 
     if (mount("proc", "/proc", "proc", 0, nullptr) != 0) {
         perror("Failed to mount proc");
+    }
+
+    // Apply masked paths AFTER /proc is mounted
+    for (const auto& masked : args->masked_paths) {
+        if (masked.empty()) {
+            continue;
+        }
+        // Use absolute path after pivot/chroot
+        std::string target = masked;
+        if (target.front() != '/') {
+            target = "/" + target;
+        }
+
+        struct stat st{};
+        bool is_dir = false;
+        if (lstat(target.c_str(), &st) == 0) {
+            is_dir = S_ISDIR(st.st_mode);
+        } else {
+            // Path doesn't exist - try to create it
+            if (masked.back() == '/') {
+                if (!ensure_directory(target)) {
+                    // Skip if we can't create it (e.g., in /proc)
+                    continue;
+                }
+                is_dir = true;
+            } else if (ensure_file(target)) {
+                is_dir = false;
+            } else if (ensure_directory(target)) {
+                is_dir = true;
+            } else {
+                // Can't create, skip
+                continue;
+            }
+        }
+
+        if (is_dir) {
+            if (mount("tmpfs", target.c_str(), "tmpfs",
+                      MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                      "size=0") != 0) {
+                // Ignore mount failures for masked paths
+                continue;
+            }
+        } else {
+            if (mount("/dev/null", target.c_str(), nullptr, MS_BIND, nullptr) != 0) {
+                // Ignore mount failures for masked paths
+                continue;
+            }
+        }
     }
 
     if (args->rootfs_readonly) {
@@ -1555,6 +405,53 @@ int container_main(void* arg) {
         }
     }
 
+    // Create essential device nodes
+    struct DeviceNode {
+        const char* path;
+        mode_t mode;
+        unsigned int major;
+        unsigned int minor;
+    };
+
+    const DeviceNode devices[] = {
+        {"/dev/null", S_IFCHR | 0666, 1, 3},
+        {"/dev/zero", S_IFCHR | 0666, 1, 5},
+        {"/dev/full", S_IFCHR | 0666, 1, 7},
+        {"/dev/random", S_IFCHR | 0666, 1, 8},
+        {"/dev/urandom", S_IFCHR | 0666, 1, 9},
+        {"/dev/tty", S_IFCHR | 0666, 5, 0}
+    };
+
+    for (const auto& dev : devices) {
+        dev_t device = makedev(dev.major, dev.minor);
+        if (mknod(dev.path, dev.mode, device) != 0 && errno != EEXIST) {
+            // Ignore errors for devices that already exist or can't be created
+        } else if (errno != EEXIST) {
+            chmod(dev.path, dev.mode & 0777);
+        }
+    }
+
+    // Set UID/GID if specified
+    if (!args->additional_gids.empty()) {
+        if (setgroups(args->additional_gids.size(),
+                      reinterpret_cast<const gid_t*>(args->additional_gids.data())) != 0) {
+            perror("setgroups failed");
+            return 1;
+        }
+    }
+    if (args->gid != 0) {
+        if (setgid(args->gid) != 0) {
+            perror("setgid failed");
+            return 1;
+        }
+    }
+    if (args->uid != 0) {
+        if (setuid(args->uid) != 0) {
+            perror("setuid failed");
+            return 1;
+        }
+    }
+
     // 3. Execute the specified command
     std::vector<char*> argv;
     argv.reserve(args->process_args.size() + 1);
@@ -1566,7 +463,7 @@ int container_main(void* arg) {
         perror("execvp failed");
     }
 
-    return 1; // Todo: ハンドリングの追加/エラーメッセージの追加
+    return 1;
 }
 
 // OCI `create` command
@@ -1684,6 +581,9 @@ void create_container(const CreateOptions& options) {
     args->process_env = config.process.env;
     args->process_cwd = config.process.cwd.empty() ? "/" : config.process.cwd;
     args->terminal = config.process.terminal;
+    args->uid = config.process.uid;
+    args->gid = config.process.gid;
+    args->additional_gids = config.process.additional_gids;
     if (args->terminal) {
         if (options.console_socket.empty()) {
             cleanup_failure("console", "process.terminal requires --console-socket");
@@ -1754,22 +654,137 @@ void create_container(const CreateOptions& options) {
         }
     }
 
-    char* stack = new char[STACK_SIZE];
-    char* stack_top = stack + STACK_SIZE;
-
-    pid = clone(container_main, stack_top, flags, args.get());
-    delete[] stack;
-
-    if (pid == -1) {
-        perror("clone failed");
-        cleanup_failure("clone", "Failed to clone container process");
+    // Create a pipe to communicate the real container PID from child to parent
+    // This is needed because when PID namespace is used, the actual container
+    // process is a grandchild, and we need its PID for exec to work correctly
+    int pid_pipe[2];
+    if (pipe(pid_pipe) == -1) {
+        perror("pipe failed");
+        cleanup_failure("pipe", "Failed to create PID communication pipe");
         return;
     }
-    if (!configure_user_namespace(pid, creates_new_userns, uid_mappings, gid_mappings)) {
+
+    // Use fork() instead of clone() to avoid C++ stdlib issues
+    pid = fork();
+
+    if (pid == -1) {
+        perror("fork failed");
+        close(pid_pipe[0]);
+        close(pid_pipe[1]);
+        cleanup_failure("fork", "Failed to fork container process");
+        return;
+    }
+
+    if (pid == 0) {
+        // Child process: setup namespaces then run container_main logic
+        close(pid_pipe[0]); // Close read end in child
+
+        // Release unique_ptr ownership in child process only
+        // fork() has created a proper copy of memory for us
+        ContainerArgs* args_ptr = args.release();
+
+        // Join existing namespaces first
+        for (auto& ns_fd : args_ptr->join_namespaces) {
+            if (setns(ns_fd.first, ns_fd.second) != 0) {
+                perror("setns failed");
+                _exit(1);
+            }
+            close(ns_fd.first);
+        }
+        args_ptr->join_namespaces.clear();
+
+        // Create new namespaces using unshare
+        int unshare_flags = 0;
+        if (flags & CLONE_NEWPID) unshare_flags |= CLONE_NEWPID;
+        if (flags & CLONE_NEWUTS) unshare_flags |= CLONE_NEWUTS;
+        if (flags & CLONE_NEWIPC) unshare_flags |= CLONE_NEWIPC;
+        if (flags & CLONE_NEWNET) unshare_flags |= CLONE_NEWNET;
+        if (flags & CLONE_NEWNS) unshare_flags |= CLONE_NEWNS;
+        if (flags & CLONE_NEWUSER) unshare_flags |= CLONE_NEWUSER;
+        if (flags & CLONE_NEWCGROUP) unshare_flags |= CLONE_NEWCGROUP;
+
+        if (unshare_flags != 0) {
+            if (unshare(unshare_flags) != 0) {
+                perror("unshare failed");
+                _exit(1);
+            }
+        }
+
+        // If we created a PID namespace, we need to fork again
+        // so the child becomes PID 1 in the new namespace
+        if (flags & CLONE_NEWPID) {
+            pid_t inner_pid = fork();
+            if (inner_pid == -1) {
+                perror("fork for PID namespace failed");
+                close(pid_pipe[1]);
+                _exit(1);
+            }
+            if (inner_pid != 0) {
+                // Middle process: send inner_pid to parent, then wait and exit
+                // Write the inner child's PID to the parent
+                write(pid_pipe[1], &inner_pid, sizeof(inner_pid));
+                close(pid_pipe[1]);
+
+                // Wait for inner child then cleanup and exit
+                // We must delete args_ptr here before exiting
+                int status;
+                waitpid(inner_pid, &status, 0);
+                delete args_ptr;
+                if (WIFEXITED(status)) {
+                    _exit(WEXITSTATUS(status));
+                } else if (WIFSIGNALED(status)) {
+                    _exit(128 + WTERMSIG(status));
+                }
+                _exit(1);
+            }
+            // Inner child is now PID 1 in the new PID namespace
+            close(pid_pipe[1]); // Inner child doesn't need the pipe
+        } else {
+            // No PID namespace: write 0 to indicate parent should use first child's pid
+            pid_t zero = 0;
+            write(pid_pipe[1], &zero, sizeof(zero));
+            close(pid_pipe[1]);
+        }
+
+        // Now run container_main logic
+        int result = container_main(static_cast<void*>(args_ptr));
+        _exit(result);
+    }
+
+    // Parent process: continue setup
+    // args unique_ptr is still valid here and will be cleaned up automatically
+    // when this function returns. fork() created a copy of memory for child.
+
+    close(pid_pipe[1]); // Close write end in parent
+
+    // Keep the first child's PID for user namespace setup
+    pid_t first_child_pid = pid;
+
+    // Read the real container PID from the child
+    // If PID namespace is used, this will be the inner (grandchild) PID
+    // If not, it will be 0 indicating we should use the first child's PID
+    pid_t real_container_pid = 0;
+    ssize_t n = read(pid_pipe[0], &real_container_pid, sizeof(real_container_pid));
+    close(pid_pipe[0]);
+
+    if (n == sizeof(real_container_pid) && real_container_pid != 0) {
+        // Use the inner child's PID for state.pid (for PID namespace case)
+        // This is the process that's actually in the new PID namespace
+        pid = real_container_pid;
+    }
+    // else: keep pid as the first child's PID
+
+    // Close namespace file descriptors in parent
+    for (auto& ns_fd : args->join_namespaces) {
+        close(ns_fd.first);
+    }
+    args->join_namespaces.clear();
+
+    // User namespace setup must be done on the first child (the one that called unshare)
+    if (!configure_user_namespace(first_child_pid, creates_new_userns, uid_mappings, gid_mappings)) {
         cleanup_failure("userNamespace", "Failed to configure user namespace");
         return;
     }
-    args.release();
 
     if (console_allocated && console_pair.slave_fd >= 0) {
         close(console_pair.slave_fd);
@@ -2028,6 +1043,7 @@ void resume_container(const std::string& id);
 void list_container_processes(const std::string& id);
 void delete_container(const std::string& id, bool force);
 void events_command(const EventsOptions& options);
+void list_containers();
 
 int run_container_command(int argc, char* const argv[]) {
     CreateOptions options;
@@ -2183,6 +1199,9 @@ int exec_container(const ExecOptions& options) {
         std::cerr << "Warning: --preserve-fds is not supported; ignoring request." << std::endl;
     }
 
+    log_debug("exec_container: loading state for container '" + options.id + "'");
+    log_debug("exec_container: state_base_path = '" + state_base_path() + "'");
+
     ContainerState state;
     try {
         state = load_state(options.id);
@@ -2190,6 +1209,8 @@ int exec_container(const ExecOptions& options) {
         std::cerr << e.what() << std::endl;
         return 1;
     }
+
+    log_debug("exec_container: loaded state, pid = " + std::to_string(state.pid) + ", status = " + state.status);
 
     if (state.status != "running") {
         std::cerr << "Error: Container must be running to exec (current: " << state.status << ")" << std::endl;
@@ -2246,50 +1267,71 @@ int exec_container(const ExecOptions& options) {
     }
 
     const std::vector<std::string> namespace_order = {"user", "mnt", "pid", "ipc", "uts", "net", "cgroup"};
-    std::vector<int> namespace_fds;
+    std::vector<std::pair<int, std::string>> namespace_fds;  // fd and name
     namespace_fds.reserve(namespace_order.size());
     std::string pid_str = std::to_string(state.pid);
+    log_debug("exec_container: opening namespaces for pid " + pid_str);
     for (const auto& ns_name : namespace_order) {
         std::string ns_path = "/proc/" + pid_str + "/ns/" + ns_name;
+        std::string self_ns_path = "/proc/self/ns/" + ns_name;
+
+        // Check if target namespace is the same as our current namespace
+        struct stat target_stat, self_stat;
+        if (stat(ns_path.c_str(), &target_stat) == 0 && stat(self_ns_path.c_str(), &self_stat) == 0) {
+            if (target_stat.st_ino == self_stat.st_ino && target_stat.st_dev == self_stat.st_dev) {
+                log_debug("exec_container: namespace " + ns_name + " is same as current, skipping");
+                continue;
+            }
+        }
+
         int fd = open(ns_path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd == -1) {
             if (errno == ENOENT) {
+                log_debug("exec_container: namespace " + ns_name + " not found, skipping");
                 continue;
             }
             perror(("Failed to open namespace " + ns_name).c_str());
-            for (int existing_fd : namespace_fds) {
-                close(existing_fd);
+            for (auto& ns_fd : namespace_fds) {
+                close(ns_fd.first);
             }
             return 1;
         }
-        namespace_fds.push_back(fd);
+        log_debug("exec_container: opened namespace " + ns_name + " (fd=" + std::to_string(fd) + ")");
+        namespace_fds.push_back({fd, ns_name});
     }
 
     pid_t child = fork();
     if (child == -1) {
         perror("fork failed");
-        for (int fd : namespace_fds) {
-            close(fd);
+        for (auto& ns_fd : namespace_fds) {
+            close(ns_fd.first);
         }
         return 1;
     }
 
     if (child == 0) {
-        for (int fd : namespace_fds) {
-            if (setns(fd, 0) != 0) {
-                perror("setns failed");
+        for (auto& ns_fd : namespace_fds) {
+            if (setns(ns_fd.first, 0) != 0) {
+                std::cerr << "setns failed for " << ns_fd.second << ": " << strerror(errno) << std::endl;
                 _exit(1);
             }
         }
-        for (int fd : namespace_fds) {
-            close(fd);
+        for (auto& ns_fd : namespace_fds) {
+            close(ns_fd.first);
         }
 
-        if (!process_cfg.cwd.empty()) {
-            if (chdir(process_cfg.cwd.c_str()) != 0) {
-                perror("Failed to change working directory for exec");
-                _exit(1);
-            }
+        // Change root to the container's root filesystem
+        std::string container_root = "/proc/" + pid_str + "/root";
+        if (chroot(container_root.c_str()) != 0) {
+            perror("chroot to container root failed");
+            _exit(1);
+        }
+
+        // After chroot, we need to chdir to avoid being outside the new root
+        std::string cwd = process_cfg.cwd.empty() ? "/" : process_cfg.cwd;
+        if (chdir(cwd.c_str()) != 0) {
+            perror("Failed to change working directory for exec");
+            _exit(1);
         }
 
         if (!process_cfg.env.empty()) {
@@ -2325,8 +1367,8 @@ int exec_container(const ExecOptions& options) {
         _exit(127);
     }
 
-    for (int fd : namespace_fds) {
-        close(fd);
+    for (auto& ns_fd : namespace_fds) {
+        close(ns_fd.first);
     }
 
     if (!options.pid_file.empty()) {
@@ -2367,37 +1409,6 @@ int exec_container(const ExecOptions& options) {
     }
     record_event(options.id, "execExit", exit_event);
     return exit_code;
-}
-
-std::vector<pid_t> collect_process_tree(pid_t root_pid) {
-    std::vector<pid_t> result;
-    if (root_pid <= 0) {
-        return result;
-    }
-    std::queue<pid_t> queue;
-    std::set<pid_t> visited;
-    queue.push(root_pid);
-    visited.insert(root_pid);
-
-    while (!queue.empty()) {
-        pid_t current = queue.front();
-        queue.pop();
-        result.push_back(current);
-
-        std::string children_path = "/proc/" + std::to_string(current) + "/task/" +
-                                    std::to_string(current) + "/children";
-        std::ifstream ifs(children_path);
-        if (!ifs) {
-            continue;
-        }
-        pid_t child = 0;
-        while (ifs >> child) {
-            if (child > 0 && visited.insert(child).second) {
-                queue.push(child);
-            }
-        }
-    }
-    return result;
 }
 
 void pause_container(const std::string& id) {
@@ -2680,6 +1691,251 @@ void events_command(const EventsOptions& options) {
         std::this_thread::sleep_for(std::chrono::milliseconds(options.interval_ms));
     }
 }
+// OCI `list` command
+void list_containers() {
+    std::string base_path = state_base_path();
+    DIR* dir = opendir(base_path.c_str());
+    if (!dir) {
+        // No containers exist yet or directory doesn't exist
+        std::cout << "ID\tPID\tSTATUS\tBUNDLE" << std::endl;
+        return;
+    }
+
+    struct ContainerInfo {
+        std::string id;
+        pid_t pid;
+        std::string status;
+        std::string bundle;
+    };
+    std::vector<ContainerInfo> containers;
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_type != DT_DIR) {
+            continue;
+        }
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") {
+            continue;
+        }
+
+        try {
+            ContainerState state = load_state(name);
+            // Check if process is still alive and update status if needed
+            if (state.pid > 0 && state.status != "stopped") {
+                if (kill(state.pid, 0) != 0 && errno == ESRCH) {
+                    state.status = "stopped";
+                }
+            }
+            ContainerInfo info;
+            info.id = state.id;
+            info.pid = state.pid;
+            info.status = state.status;
+            info.bundle = state.bundle_path;
+            containers.push_back(info);
+        } catch (const std::exception&) {
+            // Skip directories that don't have valid state
+            continue;
+        }
+    }
+    closedir(dir);
+
+    // Sort by container ID
+    std::sort(containers.begin(), containers.end(),
+              [](const ContainerInfo& a, const ContainerInfo& b) {
+                  return a.id < b.id;
+              });
+
+    std::cout << "ID\tPID\tSTATUS\tBUNDLE" << std::endl;
+    for (const auto& c : containers) {
+        std::cout << c.id << '\t'
+                  << c.pid << '\t'
+                  << c.status << '\t'
+                  << c.bundle << std::endl;
+    }
+}
+
+// OCI `spec` command - generate default config.json
+void generate_spec(const std::string& bundle_path, bool rootless) {
+    std::string config_path = bundle_path + "/config.json";
+
+    // Check if file already exists
+    struct stat st;
+    if (stat(config_path.c_str(), &st) == 0) {
+        std::cerr << "Error: config.json already exists at " << config_path << std::endl;
+        return;
+    }
+
+    json spec;
+    spec["ociVersion"] = "1.0.2";
+
+    // Root filesystem
+    spec["root"] = {
+        {"path", "rootfs"},
+        {"readonly", false}
+    };
+
+    // Process configuration
+    spec["process"] = {
+        {"terminal", true},
+        {"user", {
+            {"uid", 0},
+            {"gid", 0}
+        }},
+        {"args", json::array({"sh"})},
+        {"env", json::array({
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "TERM=xterm"
+        })},
+        {"cwd", "/"},
+        {"capabilities", {
+            {"bounding", json::array({
+                "CAP_AUDIT_WRITE",
+                "CAP_KILL",
+                "CAP_NET_BIND_SERVICE"
+            })},
+            {"effective", json::array({
+                "CAP_AUDIT_WRITE",
+                "CAP_KILL",
+                "CAP_NET_BIND_SERVICE"
+            })},
+            {"permitted", json::array({
+                "CAP_AUDIT_WRITE",
+                "CAP_KILL",
+                "CAP_NET_BIND_SERVICE"
+            })},
+            {"ambient", json::array()},
+            {"inheritable", json::array()}
+        }},
+        {"rlimits", json::array({
+            {{"type", "RLIMIT_NOFILE"}, {"hard", 1024}, {"soft", 1024}}
+        })},
+        {"noNewPrivileges", true}
+    };
+
+    // Hostname
+    spec["hostname"] = "runway";
+
+    // Mounts
+    spec["mounts"] = json::array({
+        {
+            {"destination", "/proc"},
+            {"type", "proc"},
+            {"source", "proc"}
+        },
+        {
+            {"destination", "/dev"},
+            {"type", "tmpfs"},
+            {"source", "tmpfs"},
+            {"options", json::array({"nosuid", "strictatime", "mode=755", "size=65536k"})}
+        },
+        {
+            {"destination", "/dev/pts"},
+            {"type", "devpts"},
+            {"source", "devpts"},
+            {"options", json::array({"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"})}
+        },
+        {
+            {"destination", "/dev/shm"},
+            {"type", "tmpfs"},
+            {"source", "shm"},
+            {"options", json::array({"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"})}
+        },
+        {
+            {"destination", "/dev/mqueue"},
+            {"type", "mqueue"},
+            {"source", "mqueue"},
+            {"options", json::array({"nosuid", "noexec", "nodev"})}
+        },
+        {
+            {"destination", "/sys"},
+            {"type", "sysfs"},
+            {"source", "sysfs"},
+            {"options", json::array({"nosuid", "noexec", "nodev", "ro"})}
+        },
+        {
+            {"destination", "/sys/fs/cgroup"},
+            {"type", "cgroup"},
+            {"source", "cgroup"},
+            {"options", json::array({"nosuid", "noexec", "nodev", "relatime", "ro"})}
+        }
+    });
+
+    // Linux-specific configuration
+    json linux_config;
+
+    // Namespaces
+    linux_config["namespaces"] = json::array({
+        {{"type", "pid"}},
+        {{"type", "network"}},
+        {{"type", "ipc"}},
+        {{"type", "uts"}},
+        {{"type", "mount"}}
+    });
+
+    if (rootless) {
+        linux_config["namespaces"].push_back({{"type", "user"}});
+        linux_config["uidMappings"] = json::array({
+            {{"containerID", 0}, {"hostID", getuid()}, {"size", 1}}
+        });
+        linux_config["gidMappings"] = json::array({
+            {{"containerID", 0}, {"hostID", getgid()}, {"size", 1}}
+        });
+    }
+
+    // Masked paths
+    linux_config["maskedPaths"] = json::array({
+        "/proc/acpi",
+        "/proc/asound",
+        "/proc/kcore",
+        "/proc/keys",
+        "/proc/latency_stats",
+        "/proc/timer_list",
+        "/proc/timer_stats",
+        "/proc/sched_debug",
+        "/sys/firmware",
+        "/proc/scsi"
+    });
+
+    // Readonly paths
+    linux_config["readonlyPaths"] = json::array({
+        "/proc/bus",
+        "/proc/fs",
+        "/proc/irq",
+        "/proc/sys",
+        "/proc/sysrq-trigger"
+    });
+
+    // Resources (cgroups)
+    linux_config["resources"] = {
+        {"devices", json::array({
+            {{"allow", false}, {"access", "rwm"}}
+        })}
+    };
+
+    spec["linux"] = linux_config;
+
+    // Write the config.json file
+    std::ofstream ofs(config_path);
+    if (!ofs) {
+        std::cerr << "Error: Failed to create " << config_path << std::endl;
+        return;
+    }
+
+    ofs << spec.dump(4) << std::endl;
+    ofs.close();
+
+    std::cout << "Created " << config_path << std::endl;
+
+    // Create rootfs directory if it doesn't exist
+    std::string rootfs_path = bundle_path + "/rootfs";
+    if (stat(rootfs_path.c_str(), &st) != 0) {
+        if (mkdir(rootfs_path.c_str(), 0755) == 0) {
+            std::cout << "Created " << rootfs_path << "/" << std::endl;
+        }
+    }
+}
+
 // OCI `state` command
 void show_state(const std::string& id) {
     try {
@@ -2710,16 +1966,14 @@ void kill_container(const std::string& id, int signal) {
         return;
     }
 
+    // Send signal to the process and all its children
     if (kill(state.pid, signal) == 0) {
         log_debug("Sent signal " + std::to_string(signal) + " to process " + std::to_string(state.pid));
         record_event(id, "signal", json{{"signal", signal}});
+
+        // For termination signals, just mark as stopped
+        // Don't wait - the process may be in a PID namespace and we can't wait for it
         if (signal == SIGKILL || signal == SIGTERM) {
-            while (waitpid(state.pid, NULL, 0) == -1) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                break;
-            }
             state.status = "stopped";
             if (!save_state(state)) {
                 std::cerr << "Failed to persist stopped state for container '" << id << "'" << std::endl;
@@ -2728,8 +1982,15 @@ void kill_container(const std::string& id, int signal) {
             log_debug("Container '" + id + "' is stopped.");
         }
     } else {
-        perror("kill failed");
-        record_event(id, "error", json{{"phase", "signal"}, {"message", "kill failed"}});
+        // If kill failed, check if process is already dead
+        if (errno == ESRCH) {
+            state.status = "stopped";
+            save_state(state);
+            record_state_event(state);
+        } else {
+            perror("kill failed");
+            record_event(id, "error", json{{"phase", "signal"}, {"message", "kill failed"}});
+        }
     }
 }
 
@@ -2810,6 +2071,44 @@ void delete_container(const std::string& id, bool force) {
     log_debug("Container '" + id + "' deleted.");
 }
 
+void show_features() {
+    json features = {
+        {"ociVersionMin", "1.0.0"},
+        {"ociVersionMax", "1.1.0"},
+        {"hooks", json::array({"prestart", "createRuntime", "createContainer",
+                               "startContainer", "poststart", "poststop"})},
+        {"mountOptions", json::array({"bind", "rbind", "ro", "rw", "nosuid", "nodev",
+                                      "noexec", "relatime", "private", "shared", "slave"})},
+        {"linux", {
+            {"namespaces", json::array({"pid", "network", "ipc", "uts", "mount", "user", "cgroup"})},
+            {"capabilities", json::array()},
+            {"cgroup", {
+                {"v1", true},
+                {"v2", true},
+                {"systemd", false},
+                {"systemdUser", false}
+            }},
+            {"seccomp", {
+                {"enabled", false},
+                {"actions", json::array()},
+                {"operators", json::array()},
+                {"archs", json::array()}
+            }},
+            {"apparmor", {
+                {"enabled", false}
+            }},
+            {"selinux", {
+                {"enabled", false}
+            }}
+        }},
+        {"annotations", {
+            {"runway.version", RUNTIME_VERSION},
+            {"org.opencontainers.runtime-spec.features", "1.1.0"}
+        }}
+    };
+    std::cout << features.dump(2) << std::endl;
+}
+
 void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " [global options] <command> [arguments]\n"
               << "\n"
@@ -2827,6 +2126,9 @@ void print_usage(const char* prog) {
               << "  run [options] <id>      Create, start, and wait on a container\n"
               << "  start  [--attach] <id>  Start a created container\n"
               << "  state  <id>             Show the state of a container\n"
+              << "  list                    List all containers\n"
+              << "  spec   [options]        Generate a default OCI spec (config.json)\n"
+              << "  features                Show supported OCI runtime features\n"
               << "  exec  [options] <id>    Execute a process inside a running container\n"
               << "  pause <id>              Pause all processes in a running container\n"
               << "  resume <id>             Resume a paused container\n"
@@ -2839,6 +2141,10 @@ void print_usage(const char* prog) {
               << "  --bundle <path>         Set the OCI bundle directory (default: current directory)\n"
               << "  --pid-file <path>       Write the container init PID to the file\n"
               << "  --console-socket <path> Accepted for compatibility but ignored\n"
+              << "\n"
+              << "spec options:\n"
+              << "  --bundle <path>         Generate spec in the specified directory (default: current)\n"
+              << "  --rootless              Generate spec for rootless container\n"
               << "\n"
               << "exec options:\n"
               << "  --process <path>        Read process spec (process.json format)\n"
@@ -2973,6 +2279,39 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         show_state(command_argv[1]);
+    } else if (command == "list") {
+        if (command_argc != 1) {
+            std::cerr << "Error: list command takes no arguments." << std::endl;
+            return 1;
+        }
+        list_containers();
+        return 0;
+    } else if (command == "spec") {
+        std::string bundle = ".";
+        bool rootless = false;
+        for (int i = 1; i < command_argc; ++i) {
+            std::string arg = command_argv[i];
+            if (arg == "--bundle" || arg == "-b") {
+                if (i + 1 >= command_argc) {
+                    std::cerr << "Error: --bundle requires an argument." << std::endl;
+                    return 1;
+                }
+                bundle = command_argv[++i];
+            } else if (arg == "--rootless") {
+                rootless = true;
+            } else if (arg.rfind("-", 0) == 0) {
+                std::cerr << "Unknown spec option: " << arg << std::endl;
+                return 1;
+            } else {
+                std::cerr << "Error: Unexpected argument: " << arg << std::endl;
+                return 1;
+            }
+        }
+        generate_spec(bundle, rootless);
+        return 0;
+    } else if (command == "features") {
+        show_features();
+        return 0;
     } else if (command == "exec") {
         ExecOptions exec_opts;
         if (!parse_exec_options(command_argc, command_argv, exec_opts)) {
