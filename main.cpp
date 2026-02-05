@@ -72,6 +72,7 @@ struct ContainerArgs {
     std::vector<std::string> masked_paths;
     std::vector<std::string> readonly_paths;
     std::string rootfs_propagation;
+    SeccompConfig seccomp;
     std::vector<std::pair<int, int>> join_namespaces;
     bool terminal = false;
     int console_slave_fd = -1;
@@ -107,6 +108,117 @@ struct EventsOptions {
     int interval_ms = 1000;
 };
 
+static std::string join_syscall_list(const std::vector<int>& syscalls) {
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < syscalls.size(); ++i) {
+        if (i > 0) {
+            oss << ",";
+        }
+        oss << syscalls[i];
+    }
+    return oss.str();
+}
+
+static std::string normalize_oci_config_path(const SeccompConfig& seccomp) {
+    std::string path = seccomp.oci_config_path.empty() ? "/.runway/seccomp.json" : seccomp.oci_config_path;
+    if (path.front() != '/') {
+        path.insert(path.begin(), '/');
+    }
+    return path;
+}
+
+static bool write_oci_seccomp_config_file(const SeccompConfig& seccomp,
+                                          const std::string& full_path,
+                                          std::string& error) {
+    if (seccomp.oci_json.empty()) {
+        error = "seccomp OCI JSON payload is missing";
+        return false;
+    }
+    if (!ensure_parent_directory(full_path)) {
+        error = "failed to create seccomp config directory for " + full_path;
+        return false;
+    }
+    std::ofstream ofs(full_path, std::ios::trunc);
+    if (!ofs) {
+        error = "failed to open seccomp config file: " + full_path;
+        return false;
+    }
+    ofs << "{\"linux\":{\"seccomp\":" << seccomp.oci_json << "}}";
+    if (!ofs) {
+        error = "failed to write seccomp config file: " + full_path;
+        return false;
+    }
+    return true;
+}
+
+static bool build_exec_arguments(const std::vector<std::string>& process_args,
+                                 const SeccompConfig& seccomp,
+                                 std::vector<std::string>& out_args,
+                                 std::string& error) {
+    if (!seccomp.enabled) {
+        out_args = process_args;
+        return true;
+    }
+
+    if (seccomp.binary.empty()) {
+        error = "seccomp enabled but seccomp.binary is empty";
+        return false;
+    }
+
+    out_args.clear();
+    out_args.reserve(process_args.size() + 12);
+    out_args.push_back(seccomp.binary);
+    out_args.push_back("apply");
+
+    if (seccomp.oci_mode) {
+        out_args.push_back("--oci-config");
+        out_args.push_back(normalize_oci_config_path(seccomp));
+        out_args.push_back("--");
+        out_args.insert(out_args.end(), process_args.begin(), process_args.end());
+        return true;
+    }
+
+    if (!seccomp.policy.empty()) {
+        out_args.push_back("--policy");
+        out_args.push_back(seccomp.policy);
+    }
+    if (!seccomp.default_action.empty()) {
+        out_args.push_back("--default");
+        out_args.push_back(seccomp.default_action);
+    }
+    if (!seccomp.notify_sock.empty()) {
+        out_args.push_back("--notify-sock");
+        out_args.push_back(seccomp.notify_sock);
+    }
+    if (!seccomp.allow.empty()) {
+        out_args.push_back("--allow");
+        out_args.push_back(join_syscall_list(seccomp.allow));
+    }
+    if (!seccomp.deny.empty()) {
+        out_args.push_back("--deny");
+        out_args.push_back(join_syscall_list(seccomp.deny));
+        if (!seccomp.deny_action.empty()) {
+            out_args.push_back("--action");
+            out_args.push_back(seccomp.deny_action);
+        }
+    }
+    for (const auto& rule : seccomp.rules) {
+        out_args.push_back("--rule");
+        out_args.push_back(rule);
+    }
+    if (seccomp.errno_ret > 0) {
+        out_args.push_back("--errno");
+        out_args.push_back(std::to_string(seccomp.errno_ret));
+    }
+    if (seccomp.tsync) {
+        out_args.push_back("--tsync");
+    }
+
+    out_args.push_back("--");
+    out_args.insert(out_args.end(), process_args.begin(), process_args.end());
+    return true;
+}
+
 // Entry point for the child process (container)
 // This runs after fork() + unshare(), so C++ stdlib is safe to use
 int container_main(void* arg) {
@@ -130,6 +242,12 @@ int container_main(void* arg) {
     // 2. Set up the environment
     if (sethostname(args->hostname.c_str(), args->hostname.length()) != 0) {
         perror("sethostname failed");
+        return 1;
+    }
+
+    // Ensure mount changes stay within this namespace to avoid affecting the host.
+    if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
+        perror("Failed to make mounts private");
         return 1;
     }
 
@@ -226,6 +344,16 @@ int container_main(void* arg) {
                 perror(("Failed to set propagation on " + destination).c_str());
                 return 1;
             }
+        }
+    }
+
+    if (args->seccomp.enabled && args->seccomp.oci_mode) {
+        std::string oci_path = normalize_oci_config_path(args->seccomp);
+        std::string full_path = container_absolute_path(rootfs, oci_path);
+        std::string error;
+        if (!write_oci_seccomp_config_file(args->seccomp, full_path, error)) {
+            std::cerr << "Failed to prepare OCI seccomp config: " << error << std::endl;
+            return 1;
         }
     }
 
@@ -452,10 +580,17 @@ int container_main(void* arg) {
         }
     }
 
-    // 3. Execute the specified command
+    // 3. Execute the specified command (optionally via seccomp-filter)
+    std::vector<std::string> exec_args;
+    std::string seccomp_error;
+    if (!build_exec_arguments(args->process_args, args->seccomp, exec_args, seccomp_error)) {
+        std::cerr << "Failed to build seccomp command: " << seccomp_error << std::endl;
+        return 1;
+    }
+
     std::vector<char*> argv;
-    argv.reserve(args->process_args.size() + 1);
-    for (const auto& arg : args->process_args) {
+    argv.reserve(exec_args.size() + 1);
+    for (const auto& arg : exec_args) {
         argv.push_back(const_cast<char*>(arg.c_str()));
     }
     argv.push_back(nullptr);
@@ -577,6 +712,7 @@ void create_container(const CreateOptions& options) {
     args->masked_paths = config.linux.masked_paths;
     args->readonly_paths = config.linux.readonly_paths;
     args->rootfs_propagation = config.linux.rootfs_propagation;
+    args->seccomp = config.linux.seccomp;
     args->process_args = config.process.args;
     args->process_env = config.process.env;
     args->process_cwd = config.process.cwd.empty() ? "/" : config.process.cwd;
@@ -609,7 +745,7 @@ void create_container(const CreateOptions& options) {
     bool creates_new_userns = false;
     std::map<std::string, int> ns_map = {
             {"pid", CLONE_NEWPID}, {"uts", CLONE_NEWUTS}, {"ipc", CLONE_NEWIPC},
-            {"net", CLONE_NEWNET}, {"mnt", CLONE_NEWNS}, {"user", CLONE_NEWUSER},
+            {"net", CLONE_NEWNET}, {"mnt", CLONE_NEWNS}, {"mount", CLONE_NEWNS}, {"user", CLONE_NEWUSER},
             {"cgroup", CLONE_NEWCGROUP}
     };
 
@@ -814,6 +950,7 @@ void create_container(const CreateOptions& options) {
 
     state.pid = pid;
     state.status = "created";
+    state.annotations["runway.childPid"] = std::to_string(first_child_pid);
     if (!cgroup_relative_path.empty()) {
         state.annotations["runway.cgroupPath"] = cgroup_relative_path;
     }
@@ -1070,7 +1207,16 @@ int run_container_command(int argc, char* const argv[]) {
     start_container(options.id, false);
 
     int status = 0;
-    if (waitpid(state.pid, &status, 0) == -1) {
+    pid_t wait_pid = state.pid;
+    auto child_it = state.annotations.find("runway.childPid");
+    if (child_it != state.annotations.end()) {
+        try {
+            wait_pid = static_cast<pid_t>(std::stol(child_it->second));
+        } catch (const std::exception&) {
+            wait_pid = state.pid;
+        }
+    }
+    if (waitpid(wait_pid, &status, 0) == -1) {
         perror("waitpid failed");
         return 1;
     }
@@ -1334,6 +1480,18 @@ int exec_container(const ExecOptions& options) {
             _exit(1);
         }
 
+        if (config.linux.seccomp.enabled && config.linux.seccomp.oci_mode) {
+            std::string oci_path = normalize_oci_config_path(config.linux.seccomp);
+            struct stat st {};
+            if (stat(oci_path.c_str(), &st) != 0) {
+                std::string error;
+                if (!write_oci_seccomp_config_file(config.linux.seccomp, oci_path, error)) {
+                    std::cerr << "Failed to prepare OCI seccomp config for exec: " << error << std::endl;
+                    _exit(1);
+                }
+            }
+        }
+
         if (!process_cfg.env.empty()) {
             if (clearenv() != 0) {
                 perror("clearenv failed for exec");
@@ -1353,9 +1511,16 @@ int exec_container(const ExecOptions& options) {
             }
         }
 
+        std::vector<std::string> exec_args;
+        std::string seccomp_error;
+        if (!build_exec_arguments(process_cfg.args, config.linux.seccomp, exec_args, seccomp_error)) {
+            std::cerr << "Failed to build seccomp command for exec: " << seccomp_error << std::endl;
+            _exit(1);
+        }
+
         std::vector<char*> argv;
-        argv.reserve(process_cfg.args.size() + 1);
-        for (auto& arg : process_cfg.args) {
+        argv.reserve(exec_args.size() + 1);
+        for (auto& arg : exec_args) {
             argv.push_back(const_cast<char*>(arg.c_str()));
         }
         argv.push_back(nullptr);
@@ -2103,7 +2268,8 @@ void show_features() {
         }},
         {"annotations", {
             {"runway.version", RUNTIME_VERSION},
-            {"org.opencontainers.runtime-spec.features", "1.1.0"}
+            {"org.opencontainers.runtime-spec.features", "1.1.0"},
+            {"runway.seccomp-filter", "true"}
         }}
     };
     std::cout << features.dump(2) << std::endl;

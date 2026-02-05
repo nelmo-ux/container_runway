@@ -1,0 +1,11 @@
+1cb3ca26f09f79a0c8f4723490afed89  lib/x86_64-linux-gnu/libpam.so.0.85.1
+c87163d48df836dd4fef7d0f5b098991  lib/x86_64-linux-gnu/libpam_misc.so.0.82.1
+365bcf70152966805568fd7ee903be7e  lib/x86_64-linux-gnu/libpamc.so.0.82.1
+5415c4c988fa93e6528d9142b92db701  usr/share/doc/libpam0g/Debian-PAM-MiniPolicy.gz
+a8215173a307fce152aa7f888b37d6a8  usr/share/doc/libpam0g/NEWS.Debian.gz
+f7d97991272ef0983e137f33ee224cd2  usr/share/doc/libpam0g/README
+ce3d89b0d852f9edb5fd439931b955a8  usr/share/doc/libpam0g/README.Debian
+ab72b70830c7c3f493f00a88ebf5ebf4  usr/share/doc/libpam0g/TODO.Debian
+dedc14c73dfe83db456db4638b4f2aa9  usr/share/doc/libpam0g/changelog.Debian.gz
+6c05e902bc75c9e6d2da3ac75da5d47b  usr/share/doc/libpam0g/copyright
+ae7ab5b398c6745008ec3efd19e09e3d  usr/share/lintian/overrides/libpam0g

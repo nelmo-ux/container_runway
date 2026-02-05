@@ -64,6 +64,10 @@ ContainerState ContainerState::from_json(const std::string& json_str) {
 }
 
 bool save_state(const ContainerState& state) {
+    if (!ensure_runtime_root_directory()) {
+        std::cerr << "Failed to prepare runtime root directory for state" << std::endl;
+        return false;
+    }
     std::string container_path = state_base_path() + state.id;
     std::string state_file_path = container_path + "/state.json";
     if (mkdir(container_path.c_str(), 0755) != 0 && errno != EEXIST) {

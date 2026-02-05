@@ -301,6 +301,43 @@ void test_load_config(TestContext& ctx) {
     remove_tree(bundle);
 }
 
+void test_seccomp_oci_config_parse(TestContext& ctx) {
+    std::string bundle = make_temp_dir("bundle-seccomp-");
+    std::string config_json = R"JSON(
+{
+  "ociVersion": "1.1.0",
+  "root": {"path": "rootfs", "readonly": false},
+  "process": {
+    "terminal": false,
+    "args": ["/bin/true"],
+    "env": ["PATH=/bin"],
+    "cwd": "/"
+  },
+  "linux": {
+    "seccomp": {
+      "defaultAction": "SCMP_ACT_ALLOW",
+      "errnoRet": 1,
+      "syscalls": [
+        {"names": ["openat"], "action": "SCMP_ACT_ERRNO", "errnoRet": 1}
+      ]
+    }
+  }
+}
+)JSON";
+    const std::string config_path = path_join(bundle, "config.json");
+    write_file(config_path, config_json);
+    try {
+        OCIConfig config = load_config(bundle);
+        ctx.expect(config.linux.seccomp.enabled, "seccomp enabled");
+        ctx.expect(config.linux.seccomp.oci_mode, "seccomp oci mode");
+        ctx.expect(config.linux.seccomp.oci_json.find("syscalls") != std::string::npos,
+                   "seccomp oci json contains syscalls");
+    } catch (const std::exception& e) {
+        ctx.expect(false, "seccomp oci parse threw", e.what());
+    }
+    remove_tree(bundle);
+}
+
 void test_filesystem_helpers(TestContext& ctx) {
     std::string base = make_temp_dir("fs-");
     std::string nested = path_join(base, "nested");
@@ -342,6 +379,42 @@ void test_filesystem_helpers(TestContext& ctx) {
     remove_tree(xdg_dir);
 
     remove_tree(base);
+}
+
+void test_seccomp_oci_execution_flow(TestContext& ctx) {
+    SeccompConfig seccomp;
+    seccomp.enabled = true;
+    seccomp.oci_mode = true;
+    seccomp.oci_config_path = "seccomp.json";
+    seccomp.oci_json = R"JSON({"defaultAction":"SCMP_ACT_ALLOW"})JSON";
+
+    std::vector<std::string> process_args = {"/bin/echo", "hello"};
+    std::vector<std::string> out_args;
+    std::string error;
+    bool ok = build_exec_arguments(process_args, seccomp, out_args, error);
+    ctx.expect(ok, "seccomp oci build_exec_arguments");
+    if (ok) {
+        ctx.expect(out_args.size() == 7, "seccomp oci args size");
+        ctx.expect(out_args[0] == "seccomp-filter", "seccomp oci binary", out_args[0]);
+        ctx.expect(out_args[1] == "apply", "seccomp oci apply", out_args[1]);
+        ctx.expect(out_args[2] == "--oci-config", "seccomp oci flag", out_args[2]);
+        ctx.expect(out_args[3] == "/seccomp.json", "seccomp oci path", out_args[3]);
+        ctx.expect(out_args[4] == "--", "seccomp oci separator", out_args[4]);
+        ctx.expect(out_args[5] == "/bin/echo", "seccomp oci command", out_args[5]);
+        ctx.expect(out_args[6] == "hello", "seccomp oci arg", out_args[6]);
+    }
+
+    std::string temp_dir = make_temp_dir("seccomp-oci-");
+    std::string oci_path = path_join(temp_dir, "runway/seccomp.json");
+    std::string write_error;
+    bool wrote = write_oci_seccomp_config_file(seccomp, oci_path, write_error);
+    ctx.expect(wrote, "seccomp oci config write", write_error);
+    if (wrote) {
+        std::string contents = read_file(oci_path);
+        ctx.expect(contents.find("\"seccomp\"") != std::string::npos,
+                   "seccomp oci config content");
+    }
+    remove_tree(temp_dir);
 }
 
 void test_state_serialization(TestContext& ctx) {
@@ -552,7 +625,9 @@ int main() {
     test_parse_exec_options(ctx);
     test_parse_events_options(ctx);
     test_load_config(ctx);
+    test_seccomp_oci_config_parse(ctx);
     test_filesystem_helpers(ctx);
+    test_seccomp_oci_execution_flow(ctx);
     test_state_serialization(ctx);
     test_record_event(ctx);
     test_console_helpers(ctx);

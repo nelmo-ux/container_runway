@@ -14,6 +14,7 @@ Container Runwayは、OCI (Open Container Initiative) 仕様に準拠した軽�
 - **CLI拡張**: `exec`、`pause`、`resume`、`ps`、`events`などの`runc`互換コマンドを実装
 - **イベント・統計出力**: 状態遷移をイベントログに記録し、`events --stats`でCPU/メモリ統計を取得可能
 - **TTY/コンソール対応**: `process.terminal` と `--console-socket` を指定すると擬似TTYを割り当て、外部にコンソールFDを引き渡し可能
+- **seccomp (seccomp-filter連携)**: bpfMod の `seccomp-filter` CLI を外部インターフェースとして利用し、exec 直前にフィルタを適用
 
 ## 技術スタック
 - **言語**: C++11
@@ -136,6 +137,44 @@ sudo ./runtime \
   }
 }
 ```
+
+## seccomp-filter 連携
+Container Runway は bpfMod の `seccomp-filter` CLI を外部インターフェースとして利用し、
+`linux.seccomp` に **bpfMod 拡張形式**または **OCI 標準形式**のどちらかを記述できます。
+`seccomp-filter` バイナリは **rootfs 内に存在**する必要があります。
+
+例:
+```json
+{
+  "linux": {
+    "seccomp": {
+      "enabled": true,
+      "binary": "seccomp-filter",
+      "policy": "/seccomp/deny_openat.json",
+      "deny": [257],
+      "denyAction": "errno",
+      "errno": 1
+    }
+  }
+}
+```
+
+対応フィールド（bpfMod CLI に対応）:
+- `enabled` / `binary` / `policy`
+- `allow` / `deny` / `rules`
+- `defaultAction` / `denyAction` / `errno`
+- `notifySock` / `tsync`
+
+`allow` / `deny` は **syscall番号**（x86_64 前提）です。`rules` は `"sysno:action[:errno]"` 形式です。
+
+### OCI linux.seccomp の取り込み
+`linux.seccomp` に `syscalls` や `defaultAction` など **OCI 標準のフィールド**がある場合、
+ランタイムは OCI モードとして扱い、**rootfs 内に `/.runway/seccomp.json` を生成**して
+`seccomp-filter apply --oci-config /.runway/seccomp.json` を実行します。
+
+- `ociConfigPath` を指定すると生成先を変更できます。
+- `oci: true` を指定すると OCI モードを強制できます（`syscalls` が無い場合など）。
+- `syscalls[].args` / `includes` / `excludes` は **エラー**になります。
 
 ## データ構造
 

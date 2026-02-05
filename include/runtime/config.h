@@ -40,6 +40,23 @@ struct LinuxResourcesConfig {
     long long cpu_shares = 0;
 };
 
+struct SeccompConfig {
+    bool enabled = false;
+    std::string binary = "seccomp-filter";
+    bool oci_mode = false;
+    std::string oci_config_path = "/.runway/seccomp.json";
+    std::string oci_json;
+    std::string policy;
+    std::vector<int> allow;
+    std::vector<int> deny;
+    std::vector<std::string> rules;
+    std::string default_action;
+    std::string deny_action = "errno";
+    int errno_ret = 1;
+    bool tsync = false;
+    std::string notify_sock;
+};
+
 struct MountConfig {
     std::string destination;
     std::string type;
@@ -52,6 +69,7 @@ struct LinuxConfig {
     LinuxResourcesConfig resources;
     std::vector<LinuxIDMapping> uid_mappings;
     std::vector<LinuxIDMapping> gid_mappings;
+    SeccompConfig seccomp;
     std::vector<std::string> masked_paths;
     std::vector<std::string> readonly_paths;
     std::string rootfs_propagation;
@@ -93,6 +111,7 @@ void from_json(const json& j, RootConfig& r);
 void from_json(const json& j, LinuxNamespaceConfig& ns);
 void from_json(const json& j, LinuxIDMapping& map);
 void from_json(const json& j, LinuxResourcesConfig& res);
+void from_json(const json& j, SeccompConfig& seccomp);
 void from_json(const json& j, LinuxConfig& l);
 void from_json(const json& j, MountConfig& m);
 void from_json(const json& j, HookConfig& hook);
