@@ -119,6 +119,136 @@ static std::string join_syscall_list(const std::vector<int>& syscalls) {
     return oss.str();
 }
 
+// ---------------------------------------------------------------------------
+// Seccomp exit diagnostics
+// ---------------------------------------------------------------------------
+
+#ifndef SIGSYS
+#define SIGSYS 31
+#endif
+
+/// Spawn strace attached to the given PID, writing output to log_path.
+/// Returns the strace process PID (or -1 on failure).
+static pid_t spawn_strace(pid_t target_pid, const std::string& log_path) {
+    pid_t strace_pid = fork();
+    if (strace_pid < 0) {
+        perror("fork for strace failed");
+        return -1;
+    }
+    if (strace_pid == 0) {
+        // Child: exec strace
+        std::string pid_str = std::to_string(target_pid);
+        execlp("strace", "strace",
+               "-f",            // follow forks
+               "-tt",           // microsecond timestamps
+               "-T",            // show time spent in syscall
+               "-yy",           // decode fd paths and socket addresses
+               "-o", log_path.c_str(),
+               "-p", pid_str.c_str(),
+               nullptr);
+        perror("execlp strace failed");
+        _exit(127);
+    }
+    // Parent: wait briefly for strace to attach
+    usleep(200000); // 200ms
+    // Verify strace is still alive
+    int wstatus;
+    pid_t ret = waitpid(strace_pid, &wstatus, WNOHANG);
+    if (ret == strace_pid) {
+        // strace already exited (probably failed to attach)
+        std::cerr << "strace: failed to attach to PID " << target_pid << std::endl;
+        return -1;
+    }
+    return strace_pid;
+}
+
+/// Read recent dmesg entries looking for seccomp audit lines for the given PID.
+/// Returns the matching lines (may be empty if dmesg is unavailable or no match).
+static std::vector<std::string> read_seccomp_audit(pid_t pid) {
+    std::vector<std::string> results;
+    FILE* fp = popen("dmesg --time-format iso 2>/dev/null || dmesg 2>/dev/null", "r");
+    if (!fp) {
+        return results;
+    }
+    std::string pid_str = "pid=" + std::to_string(pid);
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), fp)) {
+        std::string line(buf);
+        // Kernel seccomp audit lines contain "seccomp" or "type=1326" (AUDIT_SECCOMP)
+        if ((line.find("audit") != std::string::npos || line.find("seccomp") != std::string::npos)
+            && line.find(pid_str) != std::string::npos) {
+            // Remove trailing newline
+            while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+                line.pop_back();
+            }
+            results.push_back(line);
+        }
+    }
+    pclose(fp);
+    return results;
+}
+
+/// Describe a process exit status.  When the process was killed by SIGSYS
+/// (the seccomp kill signal), emit detailed diagnostics to stderr and return
+/// structured JSON data suitable for record_event().
+static json describe_exit_status(int status, pid_t pid, const std::string& context) {
+    json info;
+    info["pid"] = pid;
+
+    if (WIFEXITED(status)) {
+        int code = WEXITSTATUS(status);
+        info["type"] = "exit";
+        info["status"] = code;
+        return info;
+    }
+
+    if (!WIFSIGNALED(status)) {
+        info["type"] = "unknown";
+        info["status"] = 1;
+        return info;
+    }
+
+    int sig = WTERMSIG(status);
+    info["type"] = "signal";
+    info["signal"] = sig;
+    info["signal_name"] = strsignal(sig) ? strsignal(sig) : "unknown";
+    info["status"] = 128 + sig;
+
+    if (sig == SIGSYS) {
+        info["seccomp"] = true;
+        std::string msg = "[seccomp] Container process (PID " + std::to_string(pid)
+                          + ") killed by SIGSYS — seccomp policy violation";
+
+        // Try to get details from kernel audit log
+        auto audit_lines = read_seccomp_audit(pid);
+        if (!audit_lines.empty()) {
+            json audit_json = json::array();
+            for (const auto& line : audit_lines) {
+                audit_json.push_back(line);
+                // Try to extract syscall number from audit line
+                auto pos = line.find("syscall=");
+                if (pos != std::string::npos) {
+                    std::string sysno_str = line.substr(pos + 8);
+                    auto end = sysno_str.find_first_not_of("0123456789");
+                    if (end != std::string::npos) {
+                        sysno_str = sysno_str.substr(0, end);
+                    }
+                    if (!sysno_str.empty()) {
+                        info["blocked_syscall"] = std::stoi(sysno_str);
+                        msg += " (syscall=" + sysno_str + ")";
+                    }
+                }
+            }
+            info["audit"] = audit_json;
+        }
+
+        std::cerr << msg << std::endl;
+        log_debug(msg);
+    }
+
+    return info;
+}
+
 static std::string normalize_oci_config_path(const SeccompConfig& seccomp) {
     std::string path = seccomp.oci_config_path.empty() ? "/.runway/seccomp.json" : seccomp.oci_config_path;
     if (path.front() != '/') {
@@ -167,7 +297,9 @@ static bool build_exec_arguments(const std::vector<std::string>& process_args,
 
     out_args.clear();
     out_args.reserve(process_args.size() + 12);
-    out_args.push_back(seccomp.binary);
+
+    // Use the injected static binary from /.runway/seccomp
+    out_args.push_back("/.runway/seccomp/seccomp-filter");
     out_args.push_back("apply");
 
     if (seccomp.oci_mode) {
@@ -347,13 +479,40 @@ int container_main(void* arg) {
         }
     }
 
-    if (args->seccomp.enabled && args->seccomp.oci_mode) {
-        std::string oci_path = normalize_oci_config_path(args->seccomp);
-        std::string full_path = container_absolute_path(rootfs, oci_path);
-        std::string error;
-        if (!write_oci_seccomp_config_file(args->seccomp, full_path, error)) {
-            std::cerr << "Failed to prepare OCI seccomp config: " << error << std::endl;
-            return 1;
+    if (args->seccomp.enabled) {
+        // Inject the statically-linked seccomp-filter binary into the rootfs
+        // so it can be exec'd after pivot_root, regardless of the container's libc.
+        const std::string inject_dir = "/.runway/seccomp";
+
+        std::string host_binary = args->seccomp.binary;
+        if (host_binary.find('/') == std::string::npos) {
+            host_binary = "/usr/local/bin/" + host_binary;
+        }
+
+        std::string dest_binary = container_absolute_path(rootfs, inject_dir + "/seccomp-filter");
+        if (!ensure_parent_directory(dest_binary)) {
+            std::cerr << "Failed to create seccomp inject dir" << std::endl;
+        } else {
+            std::ifstream src(host_binary, std::ios::binary);
+            std::ofstream dst(dest_binary, std::ios::binary | std::ios::trunc);
+            if (src && dst) {
+                dst << src.rdbuf();
+                dst.close();
+                chmod(dest_binary.c_str(), 0755);
+            } else {
+                std::cerr << "Warning: could not copy seccomp binary from "
+                          << host_binary << " to " << dest_binary << std::endl;
+            }
+        }
+
+        if (args->seccomp.oci_mode) {
+            std::string oci_path = normalize_oci_config_path(args->seccomp);
+            std::string full_path = container_absolute_path(rootfs, oci_path);
+            std::string error;
+            if (!write_oci_seccomp_config_file(args->seccomp, full_path, error)) {
+                std::cerr << "Failed to prepare OCI seccomp config: " << error << std::endl;
+                return 1;
+            }
         }
     }
 
@@ -745,8 +904,9 @@ void create_container(const CreateOptions& options) {
     bool creates_new_userns = false;
     std::map<std::string, int> ns_map = {
             {"pid", CLONE_NEWPID}, {"uts", CLONE_NEWUTS}, {"ipc", CLONE_NEWIPC},
-            {"net", CLONE_NEWNET}, {"mnt", CLONE_NEWNS}, {"mount", CLONE_NEWNS}, {"user", CLONE_NEWUSER},
-            {"cgroup", CLONE_NEWCGROUP}
+            {"net", CLONE_NEWNET}, {"network", CLONE_NEWNET},
+            {"mnt", CLONE_NEWNS}, {"mount", CLONE_NEWNS},
+            {"user", CLONE_NEWUSER}, {"cgroup", CLONE_NEWCGROUP}
     };
 
     for (const auto& ns : config.linux.namespaces) {
@@ -968,13 +1128,19 @@ void create_container(const CreateOptions& options) {
     record_state_event(state);
 
     if (!options.pid_file.empty()) {
-        if (!write_pid_file(options.pid_file, pid)) {
+        // Write first_child_pid to the pid-file, NOT the inner child PID.
+        // containerd-shim uses this PID for waitpid(). Since first_child is
+        // a direct child of the create process (reparented to the shim after
+        // create exits), the shim can successfully waitpid() on it.
+        // first_child itself waits for inner_child and propagates exit status.
+        if (!write_pid_file(options.pid_file, first_child_pid)) {
             cleanup_failure("pidFile", "Failed to write pid file: " + options.pid_file);
             return;
         }
     }
 
-    log_debug("Container '" + id + "' created with PID " + std::to_string(pid));
+    log_debug("Container '" + id + "' created with PID " + std::to_string(pid) +
+              " (shim-visible PID " + std::to_string(first_child_pid) + ")");
 }
 
 bool parse_create_options(int argc, char* const argv[], CreateOptions& options) {
@@ -1221,19 +1387,40 @@ int run_container_command(int argc, char* const argv[]) {
         return 1;
     }
 
+    json exit_info = describe_exit_status(status, wait_pid, "run");
+    record_event(options.id, "containerExit", exit_info);
+
+    // Reload state to pick up strace annotations set during start
+    try { state = load_state(options.id); } catch (...) {}
+
+    // Wait for strace to finish writing
+    auto strace_it = state.annotations.find("runway.stracePid");
+    if (strace_it != state.annotations.end()) {
+        pid_t strace_pid = static_cast<pid_t>(std::stol(strace_it->second));
+        if (strace_pid > 0) {
+            // strace should exit on its own when traced process dies;
+            // give it a moment, then force-kill if stuck
+            int strace_status;
+            for (int i = 0; i < 10; i++) {
+                pid_t r = waitpid(strace_pid, &strace_status, WNOHANG);
+                if (r == strace_pid || (r == -1 && errno == ECHILD)) break;
+                usleep(100000); // 100ms
+            }
+            kill(strace_pid, SIGTERM);
+            waitpid(strace_pid, nullptr, WNOHANG);
+        }
+        auto log_it = state.annotations.find("runway.straceLog");
+        if (log_it != state.annotations.end()) {
+            log_debug("strace log: " + log_it->second);
+        }
+    }
+
     state.status = "stopped";
     save_state(state);
 
     delete_container(options.id, false);
 
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
-    }
-    if (WIFSIGNALED(status)) {
-        return 128 + WTERMSIG(status);
-    }
-
-    return 1;
+    return exit_info.value("status", 1);
 }
 
 // OCI `start` command
@@ -1281,11 +1468,60 @@ void start_container(const std::string& id, bool attach) {
         return;
     }
 
+    // Attach strace if enabled via:
+    //   1. OCI annotation: runway.strace=true
+    //   2. Process env: RUNWAY_STRACE=1 (set via docker run -e RUNWAY_STRACE=1)
+    pid_t strace_pid = -1;
+    {
+        bool strace_enabled = false;
+        // Check OCI config annotations
+        auto it = config.annotations.find("runway.strace");
+        if (it != config.annotations.end() && !it->second.empty() && it->second != "false") {
+            strace_enabled = true;
+        }
+        // Check state annotations (copied from config at create time)
+        if (!strace_enabled) {
+            auto it2 = state.annotations.find("runway.strace");
+            if (it2 != state.annotations.end() && !it2->second.empty() && it2->second != "false") {
+                strace_enabled = true;
+            }
+        }
+        // Check process environment (docker run -e RUNWAY_STRACE=1)
+        if (!strace_enabled) {
+            for (const auto& env : config.process.env) {
+                if (env == "RUNWAY_STRACE=1" || env == "RUNWAY_STRACE=true") {
+                    strace_enabled = true;
+                    break;
+                }
+            }
+        }
+        if (strace_enabled) {
+            // Use /tmp for strace log so it persists after container deletion
+            std::string short_id = id.length() > 12 ? id.substr(0, 12) : id;
+            std::string strace_log = "/tmp/runway-strace-" + short_id + ".log";
+            log_debug("strace: attaching to PID " + std::to_string(state.pid) +
+                      ", log -> " + strace_log);
+            strace_pid = spawn_strace(state.pid, strace_log);
+            if (strace_pid > 0) {
+                state.annotations["runway.stracePid"] = std::to_string(strace_pid);
+                state.annotations["runway.straceLog"] = strace_log;
+                record_event(id, "strace", json{
+                    {"stracePid", strace_pid},
+                    {"targetPid", state.pid},
+                    {"logPath", strace_log}
+                });
+            } else {
+                std::cerr << "strace: failed to attach (is strace installed?)" << std::endl;
+            }
+        }
+    }
+
     std::string fifo_path = get_fifo_path(id);
     int fifo_fd = open(fifo_path.c_str(), O_WRONLY);
     if (fifo_fd == -1) {
         perror("Failed to open FIFO (write)");
         fail_with_event("start", "Failed to open FIFO for container start");
+        if (strace_pid > 0) { kill(strace_pid, SIGTERM); waitpid(strace_pid, nullptr, 0); }
         return;
     }
 
@@ -1293,6 +1529,7 @@ void start_container(const std::string& id, bool attach) {
         perror("Failed to write to FIFO");
         close(fifo_fd);
         fail_with_event("start", "Failed to signal container start");
+        if (strace_pid > 0) { kill(strace_pid, SIGTERM); waitpid(strace_pid, nullptr, 0); }
         return;
     }
     close(fifo_fd);
@@ -1559,21 +1796,9 @@ int exec_container(const ExecOptions& options) {
         return 1;
     }
 
-    json exit_event = {
-            {"pid", child}
-    };
-    int exit_code = 1;
-    if (WIFEXITED(status)) {
-        exit_code = WEXITSTATUS(status);
-        exit_event["type"] = "exit";
-        exit_event["status"] = exit_code;
-    } else if (WIFSIGNALED(status)) {
-        exit_code = 128 + WTERMSIG(status);
-        exit_event["type"] = "signal";
-        exit_event["status"] = exit_code;
-    }
+    json exit_event = describe_exit_status(status, child, "exec");
     record_event(options.id, "execExit", exit_event);
-    return exit_code;
+    return exit_event.value("status", 1);
 }
 
 void pause_container(const std::string& id) {
@@ -2131,31 +2356,78 @@ void kill_container(const std::string& id, int signal) {
         return;
     }
 
-    // Send signal to the process and all its children
+    // Also try to kill the first child (outer fork) if tracked
+    pid_t child_pid = -1;
+    auto child_it = state.annotations.find("runway.childPid");
+    if (child_it != state.annotations.end()) {
+        try { child_pid = static_cast<pid_t>(std::stol(child_it->second)); } catch (...) {}
+    }
+
+    // Send signal to the container init process
     if (kill(state.pid, signal) == 0) {
         log_debug("Sent signal " + std::to_string(signal) + " to process " + std::to_string(state.pid));
         record_event(id, "signal", json{{"signal", signal}});
+    } else if (errno != ESRCH) {
+        perror("kill failed");
+        record_event(id, "error", json{{"phase", "signal"}, {"message", "kill failed"}});
+    }
 
-        // For termination signals, just mark as stopped
-        // Don't wait - the process may be in a PID namespace and we can't wait for it
-        if (signal == SIGKILL || signal == SIGTERM) {
-            state.status = "stopped";
-            if (!save_state(state)) {
-                std::cerr << "Failed to persist stopped state for container '" << id << "'" << std::endl;
+    // Also signal the first child process if different
+    if (child_pid > 0 && child_pid != state.pid) {
+        kill(child_pid, signal);
+    }
+
+    // For termination signals, wait for the process to actually die
+    if (signal == SIGKILL || signal == SIGTERM) {
+        pid_t wait_target = (child_pid > 0) ? child_pid : state.pid;
+        bool exited = false;
+
+        // Poll for up to 5 seconds
+        for (int i = 0; i < 50; i++) {
+            int wstatus;
+            pid_t ret = waitpid(wait_target, &wstatus, WNOHANG);
+            if (ret == wait_target || (ret == -1 && errno == ECHILD)) {
+                exited = true;
+                break;
             }
-            record_state_event(state);
-            log_debug("Container '" + id + "' is stopped.");
+            // Also check if process still exists
+            if (kill(state.pid, 0) == -1 && errno == ESRCH) {
+                exited = true;
+                break;
+            }
+            usleep(100000); // 100ms
         }
-    } else {
-        // If kill failed, check if process is already dead
-        if (errno == ESRCH) {
-            state.status = "stopped";
-            save_state(state);
-            record_state_event(state);
-        } else {
-            perror("kill failed");
-            record_event(id, "error", json{{"phase", "signal"}, {"message", "kill failed"}});
+
+        if (!exited && signal == SIGTERM) {
+            // Escalate to SIGKILL
+            log_debug("Process did not exit after SIGTERM, sending SIGKILL");
+            kill(state.pid, SIGKILL);
+            if (child_pid > 0 && child_pid != state.pid) {
+                kill(child_pid, SIGKILL);
+            }
+            // Wait another 2 seconds
+            for (int i = 0; i < 20; i++) {
+                int wstatus;
+                pid_t ret = waitpid(wait_target, &wstatus, WNOHANG);
+                if (ret == wait_target || (ret == -1 && errno == ECHILD)) {
+                    exited = true;
+                    break;
+                }
+                if (kill(state.pid, 0) == -1 && errno == ESRCH) {
+                    exited = true;
+                    break;
+                }
+                usleep(100000);
+            }
         }
+
+        state.status = "stopped";
+        if (!save_state(state)) {
+            std::cerr << "Failed to persist stopped state for container '" << id << "'" << std::endl;
+        }
+        record_state_event(state);
+        log_debug("Container '" + id + "' is stopped (exited=" +
+                  std::string(exited ? "true" : "false") + ").");
     }
 }
 
@@ -2168,14 +2440,35 @@ void delete_container(const std::string& id, bool force) {
         std::cerr << e.what() << std::endl; return;
     }
 
-    bool process_running = (state.pid != -1 && kill(state.pid, 0) == 0);
+    // Also track the first child PID for cleanup
+    pid_t child_pid = -1;
+    auto child_it = state.annotations.find("runway.childPid");
+    if (child_it != state.annotations.end()) {
+        try { child_pid = static_cast<pid_t>(std::stol(child_it->second)); } catch (...) {}
+    }
+
+    bool process_running = (state.pid > 0 && kill(state.pid, 0) == 0);
+    if (!process_running && child_pid > 0) {
+        process_running = (kill(child_pid, 0) == 0);
+    }
 
     if (process_running && force) {
-        if (kill(state.pid, SIGKILL) != 0 && errno != ESRCH) {
-            perror("Failed to force terminate container process");
-            return;
+        // Kill both container init and first child
+        if (state.pid > 0) {
+            kill(state.pid, SIGKILL);
         }
-        waitpid(state.pid, NULL, 0);
+        if (child_pid > 0 && child_pid != state.pid) {
+            kill(child_pid, SIGKILL);
+        }
+        // Wait for processes to die
+        pid_t wait_target = (child_pid > 0) ? child_pid : state.pid;
+        for (int i = 0; i < 30; i++) {
+            int wstatus;
+            pid_t ret = waitpid(wait_target, &wstatus, WNOHANG);
+            if (ret == wait_target || (ret == -1 && errno == ECHILD)) break;
+            if (kill(state.pid, 0) == -1 && errno == ESRCH) break;
+            usleep(100000);
+        }
         process_running = false;
     }
 
@@ -2329,6 +2622,7 @@ void print_usage(const char* prog) {
 
 int main(int argc, char* argv[]) {
     g_global_options.root_path = default_state_root();
+    bool root_explicitly_set = false;
     opterr = 0;
     optind = 1;
 
@@ -2363,15 +2657,26 @@ int main(int argc, char* argv[]) {
                     g_global_options.log_format = "text";
                 }
                 break;
-            case OPT_ROOT:
-                g_global_options.root_path = optarg ? optarg : "";
-                while (g_global_options.root_path.size() > 1 && g_global_options.root_path.back() == '/') {
-                    g_global_options.root_path.pop_back();
+            case OPT_ROOT: {
+                std::string new_root = optarg ? optarg : "";
+                while (new_root.size() > 1 && new_root.back() == '/') {
+                    new_root.pop_back();
                 }
-                if (g_global_options.root_path.empty()) {
-                    g_global_options.root_path = "/";
+                if (new_root.empty()) {
+                    new_root = "/";
+                }
+                // When --root is passed multiple times (daemon.json runtimeArgs +
+                // containerd-shim), keep the first non-default value so that the
+                // user's explicit configuration is not silently overridden.
+                if (!root_explicitly_set) {
+                    g_global_options.root_path = new_root;
+                    root_explicitly_set = true;
+                } else {
+                    log_debug("ignoring duplicate --root " + new_root +
+                              " (keeping " + g_global_options.root_path + ")");
                 }
                 break;
+            }
             case OPT_VERSION:
                 std::cout << "Container Runway version " << RUNTIME_VERSION << std::endl;
                 return 0;
@@ -2513,20 +2818,37 @@ int main(int argc, char* argv[]) {
         events_command(events_opts);
         return 0;
     } else if (command == "kill") {
-        if (command_argc < 2 || command_argc > 3) {
+        // Parse: kill [--all] <container-id> [signal]
+        // containerd-shim may pass --all to kill all processes in the container
+        std::string kill_id;
+        int sig = SIGTERM;
+        for (int i = 1; i < command_argc; ++i) {
+            std::string arg = command_argv[i];
+            if (arg == "--all" || arg == "-a") {
+                // Accepted but ignored (we always kill the whole process group)
+                continue;
+            }
+            if (arg.rfind("-", 0) == 0 && arg.rfind("--", 0) == 0) {
+                log_debug("kill: ignoring unknown option: " + arg);
+                continue;
+            }
+            if (kill_id.empty()) {
+                kill_id = arg;
+            } else {
+                // Remaining positional arg is the signal
+                try {
+                    sig = std::stoi(arg);
+                } catch (const std::exception&) {
+                    std::cerr << "Invalid signal value: " << arg << std::endl;
+                    return 1;
+                }
+            }
+        }
+        if (kill_id.empty()) {
             print_usage(argv[0]);
             return 1;
         }
-        int sig = SIGTERM;
-        if (command_argc == 3) {
-            try {
-                sig = std::stoi(command_argv[2]);
-            } catch (const std::exception&) {
-                std::cerr << "Invalid signal value: " << command_argv[2] << std::endl;
-                return 1;
-            }
-        }
-        kill_container(command_argv[1], sig);
+        kill_container(kill_id, sig);
     } else if (command == "delete") {
         bool force = false;
         std::string id;
@@ -2537,8 +2859,9 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             if (arg.rfind("-", 0) == 0) {
-                std::cerr << "Unknown delete option: " << arg << std::endl;
-                return 1;
+                // Silently ignore unknown flags from containerd-shim
+                log_debug("delete: ignoring unknown option: " + arg);
+                continue;
             }
             id = arg;
             if (i + 1 < command_argc) {

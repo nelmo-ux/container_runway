@@ -1,0 +1,21 @@
+[package]
+name = "seccomp-filter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.17", features = ["derive"] }
+libseccomp = "0.4.0"
+libc = "0.2.180"
+nix = { version = "0.28.0", default-features = false, features = ["socket", "uio"] }
+serde = { version = "1.0.203", features = ["derive"] }
+serde_json = "1.0.120"
+thiserror = "1.0.63"
+
+[lib]
+name = "seccomp_filter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "seccomp-filter"
+path = "src/main.rs"

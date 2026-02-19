@@ -1,1 +1,0 @@
-{"linux":{"seccomp":{"defaultAction":"SCMP_ACT_ALLOW","errnoRet":1,"syscalls":[{"action":"SCMP_ACT_ERRNO","errnoRet":1,"names":["openat"]}]}}}

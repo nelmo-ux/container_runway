@@ -55,6 +55,13 @@ compile_commands.json
 /test/runtime_tests
 /shim/containerd-shim-runway-v2
 
+# Rust / Cargo build artifacts
+bpfMod_src/target/
+bpfMod_src/.cargo/
+
+# OCI bundles (generated at runtime / by demo scripts)
+/bundles/
+
 # Logs, dumps, pid files, and temporary junk
 *.log
 *.log.*
