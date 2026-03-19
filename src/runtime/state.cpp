@@ -70,16 +70,30 @@ bool save_state(const ContainerState& state) {
     }
     std::string container_path = state_base_path() + state.id;
     std::string state_file_path = container_path + "/state.json";
+    std::string tmp_file_path = state_file_path + ".tmp";
     if (mkdir(container_path.c_str(), 0755) != 0 && errno != EEXIST) {
         perror("Failed to create state directory");
         return false;
     }
-    std::ofstream ofs(state_file_path);
+    std::ofstream ofs(tmp_file_path);
     if (!ofs) {
-        std::cerr << "Failed to open state file: " << state_file_path << std::endl;
+        std::cerr << "Failed to open temporary state file: " << tmp_file_path << std::endl;
         return false;
     }
     ofs << state.to_json();
+    ofs.flush();
+    if (!ofs.good()) {
+        std::cerr << "Failed to write state file: " << tmp_file_path << std::endl;
+        ofs.close();
+        unlink(tmp_file_path.c_str());
+        return false;
+    }
+    ofs.close();
+    if (rename(tmp_file_path.c_str(), state_file_path.c_str()) != 0) {
+        perror("Failed to rename temporary state file");
+        unlink(tmp_file_path.c_str());
+        return false;
+    }
     return true;
 }
 

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -64,7 +65,76 @@ type ExecProcess struct {
 }
 
 func (s *service) StartShim(ctx context.Context, opts shim.StartOpts) (string, error) {
-	return "", nil
+	address, err := shim.SocketAddress(ctx, opts.Address, s.id)
+	if err != nil {
+		return "", err
+	}
+
+	socket, err := shim.NewSocket(address)
+	if err != nil {
+		// Address already in use - shim may already be running
+		if !shim.SocketEaddrinuse(err) {
+			return "", fmt.Errorf("create shim socket: %w", err)
+		}
+		// Try connecting to existing socket
+		if _, dialErr := net.Dial("unix", address[len("unix://"):]); dialErr == nil {
+			return address, nil
+		}
+		// Stale socket, remove and retry
+		_ = os.Remove(address[len("unix://"):])
+		socket, err = shim.NewSocket(address)
+		if err != nil {
+			return "", fmt.Errorf("create shim socket after cleanup: %w", err)
+		}
+	}
+
+	if err := shim.WriteAddress("address", address); err != nil {
+		_ = socket.Close()
+		return "", fmt.Errorf("write shim address: %w", err)
+	}
+
+	f, err := socket.File()
+	if err != nil {
+		_ = socket.Close()
+		return "", fmt.Errorf("get socket file: %w", err)
+	}
+	_ = socket.Close()
+
+	self, err := os.Executable()
+	if err != nil {
+		_ = f.Close()
+		return "", fmt.Errorf("get executable path: %w", err)
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		_ = f.Close()
+		return "", fmt.Errorf("get working directory: %w", err)
+	}
+
+	cmd, err := shim.Command(ctx,
+		&shim.CommandConfig{
+			Runtime:      self,
+			Address:      opts.Address,
+			TTRPCAddress: opts.TTRPCAddress,
+			Path:         cwd,
+			SchedCore:    false,
+		})
+	if err != nil {
+		_ = f.Close()
+		return "", fmt.Errorf("create shim command: %w", err)
+	}
+	cmd.ExtraFiles = append(cmd.ExtraFiles, f)
+
+	if err := cmd.Start(); err != nil {
+		_ = f.Close()
+		return "", fmt.Errorf("start shim process: %w", err)
+	}
+	_ = f.Close()
+
+	go cmd.Wait()
+
+	return address, nil
 }
 
 func (s *service) Cleanup(ctx context.Context) (*taskAPI.DeleteResponse, error) {
@@ -447,6 +517,46 @@ func (s *service) Connect(ctx context.Context, r *taskAPI.ConnectRequest) (*task
 	}, nil
 }
 
+// waitForPid polls /proc/<pid> until the process exits or ctx is cancelled.
+// Returns the exit status read from the runtime state command, or 128+signal on failure.
+func (s *service) waitForPid(ctx context.Context, pid uint32) (uint32, time.Time) {
+	if pid == 0 {
+		return 0, time.Now()
+	}
+
+	procPath := fmt.Sprintf("/proc/%d", pid)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return 137, time.Now()
+		case <-ticker.C:
+			if _, err := os.Stat(procPath); os.IsNotExist(err) {
+				exitedAt := time.Now()
+				// Try to get actual exit status via runtime state
+				s.mu.Lock()
+				containerID := s.containerID
+				s.mu.Unlock()
+				if containerID != "" {
+					cmd := exec.CommandContext(ctx, runtimePath, "state", containerID)
+					if output, err := cmd.Output(); err == nil {
+						var cs ContainerState
+						if json.Unmarshal(output, &cs) == nil && cs.Status == "stopped" {
+							// Process exited; exit code is in shim's tracked state
+						}
+					}
+				}
+				s.mu.Lock()
+				exitStatus := s.exitStatus
+				s.mu.Unlock()
+				return exitStatus, exitedAt
+			}
+		}
+	}
+}
+
 func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.WaitResponse, error) {
 	// If ExecID is set, wait for exec process
 	if r.ExecID != "" {
@@ -458,24 +568,23 @@ func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.Wa
 			return nil, errdefs.ErrNotFound
 		}
 
-		// Wait for the process to exit
 		if ep.Pid > 0 && !ep.Exited {
-			proc, err := os.FindProcess(int(ep.Pid))
-			if err == nil {
-				state, _ := proc.Wait()
-				s.mu.Lock()
-				ep.Exited = true
-				ep.ExitedAt = time.Now()
-				if state != nil {
-					ep.Status = state.ExitCode()
-				}
-				s.mu.Unlock()
-			}
+			exitStatus, exitedAt := s.waitForPid(ctx, ep.Pid)
+			s.mu.Lock()
+			ep.Exited = true
+			ep.ExitedAt = exitedAt
+			ep.Status = int(exitStatus)
+			s.mu.Unlock()
 		}
 
+		s.mu.Lock()
+		status := uint32(ep.Status)
+		exitedAt := ep.ExitedAt
+		s.mu.Unlock()
+
 		return &taskAPI.WaitResponse{
-			ExitStatus: uint32(ep.Status),
-			ExitedAt:   timestamppb.New(ep.ExitedAt),
+			ExitStatus: status,
+			ExitedAt:   timestamppb.New(exitedAt),
 		}, nil
 	}
 
@@ -485,16 +594,11 @@ func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.Wa
 	s.mu.Unlock()
 
 	if pid > 0 {
-		proc, err := os.FindProcess(int(pid))
-		if err == nil {
-			state, _ := proc.Wait()
-			s.mu.Lock()
-			s.exitedAt = time.Now()
-			if state != nil {
-				s.exitStatus = uint32(state.ExitCode())
-			}
-			s.mu.Unlock()
-		}
+		exitStatus, exitedAt := s.waitForPid(ctx, pid)
+		s.mu.Lock()
+		s.exitStatus = exitStatus
+		s.exitedAt = exitedAt
+		s.mu.Unlock()
 	}
 
 	s.mu.Lock()

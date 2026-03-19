@@ -35,34 +35,33 @@ echo "Step 2: Updating Docker daemon configuration..."
 # Create or update daemon.json
 if [ -f "$DAEMON_JSON" ]; then
     # Parse existing JSON and add runway runtime
-    python3 -c "
+    python3 - "$DAEMON_JSON" <<'PYEOF' 2>/dev/null || {
 import json
 import sys
 
+daemon_json = sys.argv[1]
 try:
-    with open('$DAEMON_JSON', 'r') as f:
+    with open(daemon_json, 'r') as f:
         config = json.load(f)
-except:
+except Exception:
     config = {}
 
 if 'runtimes' not in config:
     config['runtimes'] = {}
 
 config['runtimes']['runway'] = {
-    'path': '/usr/local/bin/runtime',
-    'runtimeArgs': ['--root', '/run/runway']
+    'path': '/usr/local/bin/runtime'
 }
 
-with open('$DAEMON_JSON', 'w') as f:
+with open(daemon_json, 'w') as f:
     json.dump(config, f, indent=2)
-" 2>/dev/null || {
+PYEOF
     # Fallback: simple replacement
     cat > "$DAEMON_JSON" <<EOF
 {
   "runtimes": {
     "runway": {
-      "path": "/usr/local/bin/runtime",
-      "runtimeArgs": ["--root", "/run/runway"]
+      "path": "/usr/local/bin/runtime"
     }
   }
 }
@@ -74,8 +73,7 @@ else
 {
   "runtimes": {
     "runway": {
-      "path": "/usr/local/bin/runtime",
-      "runtimeArgs": ["--root", "/run/runway"]
+      "path": "/usr/local/bin/runtime"
     }
   }
 }

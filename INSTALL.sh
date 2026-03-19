@@ -12,8 +12,9 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-RUNTIME_SRC="/home/nelmo/runner/runtime"
-SHIM_SRC="/home/nelmo/runner/shim/containerd-shim-runway-v2"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNTIME_SRC="$SCRIPT_DIR/runtime"
+SHIM_SRC="$SCRIPT_DIR/shim/containerd-shim-runway-v2"
 INSTALL_DIR="/usr/local/bin"
 
 echo "Step 1: Installing runtime binary..."

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::{Action, Error, Policy, PolicyBuilder, Result};
+use crate::{Action, ArgCmp, CmpOp, Error, Policy, PolicyBuilder, Result};
 use crate::syscall_table::resolve_syscall;
 
 #[derive(Debug)]
@@ -48,19 +48,50 @@ struct OciSyscall {
     #[serde(rename = "errnoRet")]
     errno_ret: Option<i64>,
     #[serde(default)]
-    args: Option<Vec<serde_json::Value>>,
+    args: Option<Vec<OciArg>>,
     #[serde(default)]
     includes: Option<serde_json::Value>,
     #[serde(default)]
     excludes: Option<serde_json::Value>,
 }
 
-/// Check if `args` contains non-empty entries.
-fn has_effective_args(args: &Option<Vec<serde_json::Value>>) -> bool {
-    match args {
-        Some(v) => !v.is_empty(),
-        None => false,
+#[derive(Debug, Deserialize)]
+struct OciArg {
+    index: u32,
+    value: u64,
+    #[serde(rename = "valueTwo", default)]
+    value_two: u64,
+    op: String,
+}
+
+/// Parse an OCI arg entry into an ArgCmp.
+fn parse_oci_arg(arg: &OciArg) -> Result<ArgCmp> {
+    if arg.index > 5 {
+        return Err(Error::OciSeccomp(format!(
+            "invalid arg index {}: must be 0-5",
+            arg.index
+        )));
     }
+    let op = match arg.op.as_str() {
+        "SCMP_CMP_NE" => CmpOp::NotEqual,
+        "SCMP_CMP_LT" => CmpOp::Less,
+        "SCMP_CMP_LE" => CmpOp::LessOrEqual,
+        "SCMP_CMP_EQ" => CmpOp::Equal,
+        "SCMP_CMP_GE" => CmpOp::GreaterEqual,
+        "SCMP_CMP_GT" => CmpOp::Greater,
+        "SCMP_CMP_MASKED_EQ" => CmpOp::MaskedEqual { mask: arg.value_two },
+        _ => {
+            return Err(Error::OciSeccomp(format!(
+                "unsupported seccomp compare op: {}",
+                arg.op
+            )));
+        }
+    };
+    Ok(ArgCmp {
+        arg: arg.index,
+        op,
+        value: arg.value,
+    })
 }
 
 /// Check if `includes`/`excludes` contains non-empty entries.
@@ -249,12 +280,6 @@ fn build_seccomp_policy(seccomp: OciSeccomp) -> Result<OciSeccompPolicy> {
 
     if let Some(syscalls) = seccomp.syscalls {
         for entry in syscalls {
-            // Skip rules with argument-level filtering (not supported).
-            if has_effective_args(&entry.args) {
-                skipped += 1;
-                continue;
-            }
-
             // Evaluate includes condition (arches-only can be resolved).
             match eval_includes(&entry.includes) {
                 ShouldApply::No => continue,        // arches don't match, skip
@@ -279,11 +304,27 @@ fn build_seccomp_policy(seccomp: OciSeccomp) -> Result<OciSeccompPolicy> {
                 continue;
             }
 
+            // Parse argument conditions.
+            let parsed_args: Vec<ArgCmp> = match &entry.args {
+                Some(args) if !args.is_empty() => {
+                    let mut v = Vec::with_capacity(args.len());
+                    for arg in args {
+                        v.push(parse_oci_arg(arg)?);
+                    }
+                    v
+                }
+                _ => Vec::new(),
+            };
+
             let action = parse_action(&entry.action, entry.errno_ret, default_errno)?;
             for name in &entry.names {
                 match resolve_syscall(name) {
                     Some(sysno) => {
-                        builder.rule(sysno, action);
+                        if parsed_args.is_empty() {
+                            builder.rule(sysno, action);
+                        } else {
+                            builder.conditional_rule(sysno, action, parsed_args.clone());
+                        }
                     }
                     None => {
                         // Skip unknown syscalls (e.g. arch-specific names like arm_fadvise64_64).
@@ -296,7 +337,7 @@ fn build_seccomp_policy(seccomp: OciSeccomp) -> Result<OciSeccompPolicy> {
 
     if skipped > 0 {
         eprintln!(
-            "seccomp: skipped {} rule(s) with unsupported args/includes/excludes conditions",
+            "seccomp: skipped {} rule(s) with unsupported includes/excludes conditions",
             skipped
         );
     }
@@ -445,10 +486,53 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_args_ignored() {
-        assert!(!has_effective_args(&None));
-        assert!(!has_effective_args(&Some(vec![])));
-        assert!(has_effective_args(&Some(vec![serde_json::Value::Null])));
+    fn test_parse_oci_arg_valid() {
+        let arg = OciArg {
+            index: 0,
+            value: 2,
+            value_two: 0,
+            op: "SCMP_CMP_EQ".to_string(),
+        };
+        let result = parse_oci_arg(&arg).unwrap();
+        assert_eq!(result.arg, 0);
+        assert_eq!(result.op, CmpOp::Equal);
+        assert_eq!(result.value, 2);
+    }
+
+    #[test]
+    fn test_parse_oci_arg_masked_eq() {
+        let arg = OciArg {
+            index: 1,
+            value: 0x10,
+            value_two: 0xFF,
+            op: "SCMP_CMP_MASKED_EQ".to_string(),
+        };
+        let result = parse_oci_arg(&arg).unwrap();
+        assert_eq!(result.arg, 1);
+        assert_eq!(result.op, CmpOp::MaskedEqual { mask: 0xFF });
+        assert_eq!(result.value, 0x10);
+    }
+
+    #[test]
+    fn test_parse_oci_arg_invalid_index() {
+        let arg = OciArg {
+            index: 6,
+            value: 0,
+            value_two: 0,
+            op: "SCMP_CMP_EQ".to_string(),
+        };
+        assert!(parse_oci_arg(&arg).is_err());
+    }
+
+    #[test]
+    fn test_parse_oci_arg_invalid_op() {
+        let arg = OciArg {
+            index: 0,
+            value: 0,
+            value_two: 0,
+            op: "SCMP_CMP_INVALID".to_string(),
+        };
+        assert!(parse_oci_arg(&arg).is_err());
     }
 
     #[test]
@@ -498,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_empty_args_skipped() {
+    fn test_args_applied() {
         let json = r#"{
             "defaultAction": "SCMP_ACT_ERRNO",
             "syscalls": [
@@ -516,9 +600,56 @@ mod tests {
         let seccomp = parse_seccomp_json(json).unwrap();
         let result = build_seccomp_policy(seccomp);
         assert!(result.is_ok());
-        // "socket" rule with args should be skipped; only read+write applied
+        // All 3 rules should be applied (read, write, and socket with args)
         let policy = result.unwrap();
-        assert_eq!(policy.policy.rules.len(), 2);
+        assert_eq!(policy.policy.rules.len(), 3);
+        // Find the socket rule and verify it has args
+        let socket_rule = policy.policy.rules.iter()
+            .find(|r| !r.args.is_empty())
+            .expect("should have a rule with args");
+        assert_eq!(socket_rule.args.len(), 1);
+        assert_eq!(socket_rule.args[0].arg, 0);
+        assert_eq!(socket_rule.args[0].op, CmpOp::Equal);
+        assert_eq!(socket_rule.args[0].value, 2);
+    }
+
+    #[test]
+    fn test_args_multiple_conditions() {
+        let json = r#"{
+            "defaultAction": "SCMP_ACT_ERRNO",
+            "syscalls": [
+                {
+                    "names": ["socket"],
+                    "action": "SCMP_ACT_ALLOW",
+                    "args": [
+                        {"index": 0, "value": 2, "op": "SCMP_CMP_EQ"},
+                        {"index": 2, "value": 0, "op": "SCMP_CMP_EQ"}
+                    ]
+                }
+            ]
+        }"#;
+        let seccomp = parse_seccomp_json(json).unwrap();
+        let result = build_seccomp_policy(seccomp).unwrap();
+        assert_eq!(result.policy.rules.len(), 1);
+        assert_eq!(result.policy.rules[0].args.len(), 2);
+    }
+
+    #[test]
+    fn test_args_empty_array_treated_as_unconditional() {
+        let json = r#"{
+            "defaultAction": "SCMP_ACT_ERRNO",
+            "syscalls": [
+                {
+                    "names": ["read"],
+                    "action": "SCMP_ACT_ALLOW",
+                    "args": []
+                }
+            ]
+        }"#;
+        let seccomp = parse_seccomp_json(json).unwrap();
+        let result = build_seccomp_policy(seccomp).unwrap();
+        assert_eq!(result.policy.rules.len(), 1);
+        assert!(result.policy.rules[0].args.is_empty());
     }
 
     #[test]

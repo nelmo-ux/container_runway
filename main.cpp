@@ -95,6 +95,8 @@ struct ExecOptions {
     std::string id;
     std::string pid_file;
     std::string process_path;
+    std::string console_socket;
+    std::string cwd;
     bool detach = false;
     bool tty = false;
     int preserve_fds = 0;
@@ -497,8 +499,16 @@ int container_main(void* arg) {
             std::ofstream dst(dest_binary, std::ios::binary | std::ios::trunc);
             if (src && dst) {
                 dst << src.rdbuf();
-                dst.close();
-                chmod(dest_binary.c_str(), 0755);
+                dst.flush();
+                if (!dst.good()) {
+                    std::cerr << "Warning: incomplete copy of seccomp binary to "
+                              << dest_binary << std::endl;
+                    dst.close();
+                    unlink(dest_binary.c_str());
+                } else {
+                    dst.close();
+                    chmod(dest_binary.c_str(), 0755);
+                }
             } else {
                 std::cerr << "Warning: could not copy seccomp binary from "
                           << host_binary << " to " << dest_binary << std::endl;
@@ -711,11 +721,11 @@ int container_main(void* arg) {
 
     for (const auto& dev : devices) {
         dev_t device = makedev(dev.major, dev.minor);
-        if (mknod(dev.path, dev.mode, device) != 0 && errno != EEXIST) {
-            // Ignore errors for devices that already exist or can't be created
-        } else if (errno != EEXIST) {
+        int ret = mknod(dev.path, dev.mode, device);
+        if (ret == 0) {
             chmod(dev.path, dev.mode & 0777);
         }
+        // mknod failed: EEXIST is fine (device already exists), others are non-fatal
     }
 
     // Set UID/GID if specified
@@ -1218,9 +1228,13 @@ bool parse_exec_options(int argc, char* const argv[], ExecOptions& options) {
     static struct option exec_long_options[] = {
             {"process", required_argument, nullptr, 'p'},
             {"pid-file", required_argument, nullptr, 'f'},
+            {"console-socket", required_argument, nullptr, 'c'},
+            {"cwd", required_argument, nullptr, 'w'},
             {"detach", no_argument, nullptr, 'd'},
             {"tty", no_argument, nullptr, 't'},
             {"preserve-fds", required_argument, nullptr, 'F'},
+            {"apparmor", required_argument, nullptr, 'A'},
+            {"no-subreaper", no_argument, nullptr, 'S'},
             {nullptr, 0, nullptr, 0}
     };
 
@@ -1235,6 +1249,12 @@ bool parse_exec_options(int argc, char* const argv[], ExecOptions& options) {
                 break;
             case 'f':
                 options.pid_file = optarg;
+                break;
+            case 'c':
+                options.console_socket = optarg;
+                break;
+            case 'w':
+                options.cwd = optarg;
                 break;
             case 'd':
                 options.detach = true;
@@ -1251,16 +1271,19 @@ bool parse_exec_options(int argc, char* const argv[], ExecOptions& options) {
                     return false;
                 }
                 break;
+            case 'A': // --apparmor: accepted but ignored
+            case 'S': // --no-subreaper: accepted but ignored
+                break;
             case '?': {
+                // Gracefully ignore unknown options with arguments
                 int idx = std::max(0, optind - 1);
-                std::cerr << "Unknown exec option: " << argv[idx] << std::endl;
-                optind = 1;
-                return false;
+                std::string unknown_opt = argv[idx];
+                log_debug("exec: ignoring unknown option: " + unknown_opt);
+                break;
             }
             default:
-                std::cerr << "Unknown exec option encountered." << std::endl;
-                optind = 1;
-                return false;
+                log_debug("exec: ignoring unknown option");
+                break;
         }
     }
 
@@ -1516,10 +1539,21 @@ void start_container(const std::string& id, bool attach) {
         }
     }
 
+    // Persist "running" state BEFORE signaling the FIFO so that the state
+    // is already on disk even if the container exits immediately.
+    state.status = "running";
+    if (!save_state(state)) {
+        fail_with_event("state", "Failed to persist running state before start");
+        if (strace_pid > 0) { kill(strace_pid, SIGTERM); waitpid(strace_pid, nullptr, 0); }
+        return;
+    }
+
     std::string fifo_path = get_fifo_path(id);
     int fifo_fd = open(fifo_path.c_str(), O_WRONLY);
     if (fifo_fd == -1) {
         perror("Failed to open FIFO (write)");
+        state.status = "created";
+        save_state(state);
         fail_with_event("start", "Failed to open FIFO for container start");
         if (strace_pid > 0) { kill(strace_pid, SIGTERM); waitpid(strace_pid, nullptr, 0); }
         return;
@@ -1528,13 +1562,14 @@ void start_container(const std::string& id, bool attach) {
     if (write(fifo_fd, "1", 1) != 1) {
         perror("Failed to write to FIFO");
         close(fifo_fd);
+        state.status = "created";
+        save_state(state);
         fail_with_event("start", "Failed to signal container start");
         if (strace_pid > 0) { kill(strace_pid, SIGTERM); waitpid(strace_pid, nullptr, 0); }
         return;
     }
     close(fifo_fd);
 
-    state.status = "running";
     if (!run_hook_sequence(config.hooks.poststart, state, "poststart")) {
         fail_with_event("poststart", "poststart hooks failed");
         if (state.pid > 0) {
@@ -1547,10 +1582,6 @@ void start_container(const std::string& id, bool attach) {
         return;
     }
 
-    if (!save_state(state)) {
-        fail_with_event("state", "Failed to persist running state");
-        return;
-    }
     record_state_event(state);
     log_debug("Container '" + id + "' started.");
 
@@ -1575,9 +1606,6 @@ void start_container(const std::string& id, bool attach) {
 }
 
 int exec_container(const ExecOptions& options) {
-    if (options.tty) {
-        std::cerr << "Warning: --tty is not supported; ignoring request." << std::endl;
-    }
     if (options.preserve_fds > 0) {
         std::cerr << "Warning: --preserve-fds is not supported; ignoring request." << std::endl;
     }
@@ -1652,7 +1680,24 @@ int exec_container(const ExecOptions& options) {
     const std::vector<std::string> namespace_order = {"user", "mnt", "pid", "ipc", "uts", "net", "cgroup"};
     std::vector<std::pair<int, std::string>> namespace_fds;  // fd and name
     namespace_fds.reserve(namespace_order.size());
-    std::string pid_str = std::to_string(state.pid);
+
+    // Use childPid (the first fork, visible from host /proc) for namespace access.
+    // state.pid is the inner child which may not be accessible via /proc from the host
+    // when it's in a new PID namespace.
+    pid_t ns_pid = state.pid;
+    auto child_it = state.annotations.find("runway.childPid");
+    if (child_it != state.annotations.end()) {
+        try {
+            pid_t cpid = static_cast<pid_t>(std::stol(child_it->second));
+            // Verify this PID is accessible
+            std::string test_path = "/proc/" + std::to_string(cpid) + "/ns/pid";
+            struct stat st;
+            if (stat(test_path.c_str(), &st) == 0) {
+                ns_pid = cpid;
+            }
+        } catch (...) {}
+    }
+    std::string pid_str = std::to_string(ns_pid);
     log_debug("exec_container: opening namespaces for pid " + pid_str);
     for (const auto& ns_name : namespace_order) {
         std::string ns_path = "/proc/" + pid_str + "/ns/" + ns_name;
@@ -1683,16 +1728,52 @@ int exec_container(const ExecOptions& options) {
         namespace_fds.push_back({fd, ns_name});
     }
 
+    // Open the container root fd BEFORE forking/setns, because after joining
+    // the mount namespace, /proc/<host_pid>/root is no longer accessible.
+    std::string container_root = "/proc/" + pid_str + "/root";
+    int root_fd = open(container_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (root_fd == -1) {
+        std::cerr << "Failed to open container root " << container_root << ": "
+                  << strerror(errno) << std::endl;
+        for (auto& ns_fd : namespace_fds) { close(ns_fd.first); }
+        return 1;
+    }
+
+    // Allocate PTY if terminal is requested (via --tty CLI flag or process.terminal in JSON)
+    // and --console-socket is specified
+    bool need_terminal = options.tty || process_cfg.terminal;
+    ConsolePair console_pair;
+    bool console_allocated = false;
+    if (need_terminal && !options.console_socket.empty()) {
+        std::string console_error;
+        if (!allocate_console_pair(console_pair, console_error)) {
+            std::cerr << "Failed to allocate console for exec: " << console_error << std::endl;
+            close(root_fd);
+            for (auto& ns_fd : namespace_fds) { close(ns_fd.first); }
+            return 1;
+        }
+        console_allocated = true;
+        log_debug("exec_container: allocated PTY pair, master_fd=" + std::to_string(console_pair.master_fd)
+                  + " slave_fd=" + std::to_string(console_pair.slave_fd));
+    }
+
     pid_t child = fork();
     if (child == -1) {
         perror("fork failed");
+        close(root_fd);
         for (auto& ns_fd : namespace_fds) {
             close(ns_fd.first);
         }
+        if (console_allocated) close_console_pair(console_pair);
         return 1;
     }
 
     if (child == 0) {
+        // Child: close master side of PTY (parent sends it via console-socket)
+        if (console_allocated && console_pair.master_fd >= 0) {
+            close(console_pair.master_fd);
+        }
+
         for (auto& ns_fd : namespace_fds) {
             if (setns(ns_fd.first, 0) != 0) {
                 std::cerr << "setns failed for " << ns_fd.second << ": " << strerror(errno) << std::endl;
@@ -1703,18 +1784,48 @@ int exec_container(const ExecOptions& options) {
             close(ns_fd.first);
         }
 
-        // Change root to the container's root filesystem
-        std::string container_root = "/proc/" + pid_str + "/root";
-        if (chroot(container_root.c_str()) != 0) {
+        // Use the pre-opened root fd to fchdir + chroot into the container rootfs
+        if (fchdir(root_fd) != 0) {
+            perror("fchdir to container root failed");
+            close(root_fd);
+            _exit(1);
+        }
+        close(root_fd);
+        if (chroot(".") != 0) {
             perror("chroot to container root failed");
             _exit(1);
         }
 
         // After chroot, we need to chdir to avoid being outside the new root
-        std::string cwd = process_cfg.cwd.empty() ? "/" : process_cfg.cwd;
-        if (chdir(cwd.c_str()) != 0) {
+        std::string cwd_path = process_cfg.cwd.empty() ? "/" : process_cfg.cwd;
+        if (!options.cwd.empty()) {
+            cwd_path = options.cwd;
+        }
+        if (chdir(cwd_path.c_str()) != 0) {
             perror("Failed to change working directory for exec");
             _exit(1);
+        }
+
+        // Set up PTY slave as stdin/stdout/stderr if console was allocated
+        if (console_allocated && console_pair.slave_fd >= 0) {
+            // Set default window size before connecting terminal
+            struct winsize ws = {};
+            ws.ws_row = 24;
+            ws.ws_col = 80;
+            ioctl(console_pair.slave_fd, TIOCSWINSZ, &ws);
+
+            // Create new session and set controlling terminal
+            setsid();
+            if (ioctl(console_pair.slave_fd, TIOCSCTTY, 0) == -1) {
+                perror("ioctl TIOCSCTTY failed");
+                // Non-fatal, continue
+            }
+            dup2(console_pair.slave_fd, STDIN_FILENO);
+            dup2(console_pair.slave_fd, STDOUT_FILENO);
+            dup2(console_pair.slave_fd, STDERR_FILENO);
+            if (console_pair.slave_fd > STDERR_FILENO) {
+                close(console_pair.slave_fd);
+            }
         }
 
         if (config.linux.seccomp.enabled && config.linux.seccomp.oci_mode) {
@@ -1769,8 +1880,28 @@ int exec_container(const ExecOptions& options) {
         _exit(127);
     }
 
+    // Parent: close slave side, send master via console-socket
+    close(root_fd);
     for (auto& ns_fd : namespace_fds) {
         close(ns_fd.first);
+    }
+
+    if (console_allocated) {
+        // Close slave in parent
+        if (console_pair.slave_fd >= 0) {
+            close(console_pair.slave_fd);
+            console_pair.slave_fd = -1;
+        }
+        // Send master fd to console-socket
+        std::string console_error;
+        if (!send_console_fd(console_pair, options.console_socket, console_error)) {
+            std::cerr << "Failed to send console fd for exec: " << console_error << std::endl;
+        }
+        // Close master after sending
+        if (console_pair.master_fd >= 0) {
+            close(console_pair.master_fd);
+            console_pair.master_fd = -1;
+        }
     }
 
     if (!options.pid_file.empty()) {
@@ -2547,10 +2678,13 @@ void show_features() {
                 {"systemdUser", false}
             }},
             {"seccomp", {
-                {"enabled", false},
-                {"actions", json::array()},
-                {"operators", json::array()},
-                {"archs", json::array()}
+                {"enabled", true},
+                {"actions", json::array({"SCMP_ACT_ALLOW", "SCMP_ACT_ERRNO", "SCMP_ACT_KILL",
+                                         "SCMP_ACT_LOG", "SCMP_ACT_NOTIFY"})},
+                {"operators", json::array({"SCMP_CMP_EQ", "SCMP_CMP_NE", "SCMP_CMP_LT",
+                                           "SCMP_CMP_LE", "SCMP_CMP_GT", "SCMP_CMP_GE",
+                                           "SCMP_CMP_MASKED_EQ"})},
+                {"archs", json::array({"SCMP_ARCH_X86_64"})}
             }},
             {"apparmor", {
                 {"enabled", false}
@@ -2622,7 +2756,6 @@ void print_usage(const char* prog) {
 
 int main(int argc, char* argv[]) {
     g_global_options.root_path = default_state_root();
-    bool root_explicitly_set = false;
     opterr = 0;
     optind = 1;
 
@@ -2657,26 +2790,15 @@ int main(int argc, char* argv[]) {
                     g_global_options.log_format = "text";
                 }
                 break;
-            case OPT_ROOT: {
-                std::string new_root = optarg ? optarg : "";
-                while (new_root.size() > 1 && new_root.back() == '/') {
-                    new_root.pop_back();
+            case OPT_ROOT:
+                g_global_options.root_path = optarg ? optarg : "";
+                while (g_global_options.root_path.size() > 1 && g_global_options.root_path.back() == '/') {
+                    g_global_options.root_path.pop_back();
                 }
-                if (new_root.empty()) {
-                    new_root = "/";
-                }
-                // When --root is passed multiple times (daemon.json runtimeArgs +
-                // containerd-shim), keep the first non-default value so that the
-                // user's explicit configuration is not silently overridden.
-                if (!root_explicitly_set) {
-                    g_global_options.root_path = new_root;
-                    root_explicitly_set = true;
-                } else {
-                    log_debug("ignoring duplicate --root " + new_root +
-                              " (keeping " + g_global_options.root_path + ")");
+                if (g_global_options.root_path.empty()) {
+                    g_global_options.root_path = "/";
                 }
                 break;
-            }
             case OPT_VERSION:
                 std::cout << "Container Runway version " << RUNTIME_VERSION << std::endl;
                 return 0;
@@ -2828,7 +2950,7 @@ int main(int argc, char* argv[]) {
                 // Accepted but ignored (we always kill the whole process group)
                 continue;
             }
-            if (arg.rfind("-", 0) == 0 && arg.rfind("--", 0) == 0) {
+            if (arg.rfind("-", 0) == 0) {
                 log_debug("kill: ignoring unknown option: " + arg);
                 continue;
             }

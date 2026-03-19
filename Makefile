@@ -17,7 +17,7 @@ BIN_DIR = $(PREFIX)/bin
 TEST_DIR = test
 TEST_TARGET = $(TEST_DIR)/runtime_tests
 BPFMOD_DIR = bpfMod_src
-SECCOMP_FILTER = $(BPFMOD_DIR)/target/release/seccomp-filter
+SECCOMP_FILTER = $(BPFMOD_DIR)/target/x86_64-unknown-linux-gnu/release/seccomp-filter
 
 .PHONY: all clean install uninstall help test seccomp-filter
 
@@ -28,7 +28,7 @@ $(TARGET): $(SRC)
 	@echo "Executable '$(TARGET)' has made."
 
 seccomp-filter:
-	cd $(BPFMOD_DIR) && cargo build --release
+	cd $(BPFMOD_DIR) && LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/lib/x86_64-linux-gnu RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target x86_64-unknown-linux-gnu
 	@echo "seccomp-filter has made."
 
 $(TEST_TARGET): $(TEST_DIR)/runtime_tests.cpp $(RUNTIME_SRC)

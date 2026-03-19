@@ -1,11 +1,13 @@
-use std::io::IoSlice;
+use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags, UnixAddr};
+use libseccomp::{ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags};
+use nix::cmsg_space;
+use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags, UnixAddr};
 use seccomp_filter::{
     apply_to_self, load_oci_seccomp_policy, load_policy, Action, ApplyOptions, Error, Policy,
     PolicyAction, PolicyBuilder, PolicyFile, Result,
@@ -23,6 +25,14 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Apply(ApplyArgs),
+    HandleNotify(HandleNotifyArgs),
+}
+
+#[derive(Parser, Debug)]
+struct HandleNotifyArgs {
+    /// Path to UNIX socket to listen on for incoming notify fd
+    #[arg(long)]
+    sock: PathBuf,
 }
 
 #[derive(Parser, Debug)]
@@ -105,6 +115,7 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Apply(args) => apply_command(args),
+        Commands::HandleNotify(args) => handle_notify_command(args),
     }
 }
 
@@ -392,4 +403,100 @@ fn parse_action(name: &str, errno_part: Option<&str>, fallback_errno: u16) -> Re
         "user-notif" => Ok(Action::UserNotif),
         _ => Err(Error::ParseRule(name.to_string())),
     }
+}
+
+// --- handle-notify subcommand ---
+
+fn handle_notify_command(args: HandleNotifyArgs) -> Result<()> {
+    let sock_path = &args.sock;
+
+    // Clean up stale socket file
+    let _ = std::fs::remove_file(sock_path);
+
+    let listener = UnixListener::bind(sock_path).map_err(|e| {
+        Error::OciSeccomp(format!("failed to bind notify socket {}: {}", sock_path.display(), e))
+    })?;
+
+    eprintln!("seccomp-notify: ソケット {} で待ち受け中...", sock_path.display());
+
+    // Accept one connection and receive the notify fd
+    let (stream, _) = listener.accept().map_err(|e| {
+        Error::OciSeccomp(format!("accept failed: {}", e))
+    })?;
+
+    let notify_fd = receive_notify_fd(&stream)?;
+    eprintln!("seccomp-notify: notify fd={} を受信しました", notify_fd);
+
+    // Clean up socket file
+    let _ = std::fs::remove_file(sock_path);
+
+    // Handle notifications in a loop
+    run_notify_loop(notify_fd)
+}
+
+fn receive_notify_fd(stream: &UnixStream) -> Result<i32> {
+    let mut buf = [0u8; 1];
+    let mut iov = [IoSliceMut::new(&mut buf)];
+    let mut cmsg_buf = cmsg_space!([i32; 1]);
+
+    let msg = recvmsg::<UnixAddr>(
+        stream.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg_buf),
+        MsgFlags::empty(),
+    )?;
+
+    for cmsg in msg.cmsgs() {
+        if let ControlMessageOwned::ScmRights(fds) = cmsg {
+            if let Some(&fd) = fds.first() {
+                return Ok(fd);
+            }
+        }
+    }
+
+    Err(Error::NotifyListenerMissing)
+}
+
+fn run_notify_loop(notify_fd: i32) -> Result<()> {
+    eprintln!("seccomp-notify: ハンドラ待機中...");
+
+    loop {
+        let req = match ScmpNotifReq::receive(notify_fd) {
+            Ok(req) => req,
+            Err(e) => {
+                eprintln!("seccomp-notify: 対象プロセスが終了しました ({})", e);
+                break;
+            }
+        };
+
+        let syscall_name = req.data.syscall
+            .get_name()
+            .unwrap_or_else(|_| format!("syscall#{}", req.data.syscall.as_raw_syscall()));
+
+        eprintln!(
+            "seccomp-notify: [警告] pid={} がシステムコール {}({}) を呼び出しましたが、このカーネルでは利用できません (ENOSYS) | args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+            req.pid,
+            syscall_name,
+            req.data.syscall.as_raw_syscall(),
+            req.data.args[0],
+            req.data.args[1],
+            req.data.args[2],
+            req.data.args[3],
+            req.data.args[4],
+            req.data.args[5],
+        );
+
+        // ENOSYS（「機能が実装されていない」）で応答
+        let resp = ScmpNotifResp::new_error(req.id, -libc::ENOSYS, ScmpNotifRespFlags::empty());
+        match resp.respond(notify_fd) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("seccomp-notify: 応答失敗 ({})", e);
+                continue;
+            }
+        }
+    }
+
+    eprintln!("seccomp-notify: ハンドラを終了します");
+    Ok(())
 }

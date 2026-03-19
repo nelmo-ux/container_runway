@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::os::fd::{FromRawFd, OwnedFd};
 
-use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
+use libseccomp::{ScmpAction, ScmpArgCompare, ScmpCompareOp, ScmpFilterContext, ScmpSyscall};
 use libseccomp::error::SeccompError;
 #[cfg(target_arch = "x86_64")]
 use libseccomp::ScmpArch;
@@ -25,10 +25,29 @@ impl Default for Action {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgCmp {
+    pub arg: u32,
+    pub op: CmpOp,
+    pub value: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    NotEqual,
+    Less,
+    LessOrEqual,
+    Equal,
+    GreaterEqual,
+    Greater,
+    MaskedEqual { mask: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     pub syscall: i32,
     pub action: Action,
+    pub args: Vec<ArgCmp>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +123,7 @@ struct PendingRule {
 pub struct PolicyBuilder {
     default_action: Action,
     rules: HashMap<i32, PendingRule>,
+    conditional_rules: Vec<Rule>,
 }
 
 impl PolicyBuilder {
@@ -111,6 +131,7 @@ impl PolicyBuilder {
         Self {
             default_action,
             rules: HashMap::new(),
+            conditional_rules: Vec::new(),
         }
     }
 
@@ -144,6 +165,15 @@ impl PolicyBuilder {
         self
     }
 
+    pub fn conditional_rule(&mut self, sysno: i32, action: Action, args: Vec<ArgCmp>) -> &mut Self {
+        self.conditional_rules.push(Rule {
+            syscall: sysno,
+            action,
+            args,
+        });
+        self
+    }
+
     pub fn build(self) -> Policy {
         let mut rules: Vec<Rule> = self
             .rules
@@ -151,8 +181,10 @@ impl PolicyBuilder {
             .map(|(syscall, pending)| Rule {
                 syscall,
                 action: pending.action,
+                args: Vec::new(),
             })
             .collect();
+        rules.extend(self.conditional_rules);
         rules.sort_by_key(|rule| rule.syscall);
 
         Policy {
@@ -202,7 +234,14 @@ pub fn apply_to_self(policy: &Policy, options: ApplyOptions) -> Result<AppliedFi
     for rule in &policy.rules {
         let action = to_scmp_action(rule.action)?;
         let syscall = ScmpSyscall::from_raw_syscall(rule.syscall as libseccomp::RawSyscall);
-        ctx.add_rule(action, syscall)?;
+        if rule.args.is_empty() {
+            ctx.add_rule(action, syscall)?;
+        } else {
+            let comparators: Vec<ScmpArgCompare> = rule.args.iter()
+                .map(to_scmp_arg_compare)
+                .collect();
+            ctx.add_rule_conditional(action, syscall, &comparators)?;
+        }
     }
 
     ctx.load()?;
@@ -231,4 +270,17 @@ fn to_scmp_action(action: Action) -> Result<ScmpAction> {
         Action::UserNotif => ScmpAction::Notify,
     };
     Ok(scmp_action)
+}
+
+fn to_scmp_arg_compare(arg: &ArgCmp) -> ScmpArgCompare {
+    let op = match arg.op {
+        CmpOp::NotEqual => ScmpCompareOp::NotEqual,
+        CmpOp::Less => ScmpCompareOp::Less,
+        CmpOp::LessOrEqual => ScmpCompareOp::LessOrEqual,
+        CmpOp::Equal => ScmpCompareOp::Equal,
+        CmpOp::GreaterEqual => ScmpCompareOp::GreaterEqual,
+        CmpOp::Greater => ScmpCompareOp::Greater,
+        CmpOp::MaskedEqual { mask } => ScmpCompareOp::MaskedEqual(mask),
+    };
+    ScmpArgCompare::new(arg.arg, op, arg.value)
 }
